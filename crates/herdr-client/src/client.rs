@@ -3,9 +3,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::protocol::{encode_request, parse_line, ErrorBody, Method, ResponseResult, ServerLine};
+use crate::protocol::{
+    encode_request, parse_line, ErrorBody, Method, ResponseResult, ServerLine, Subscription,
+};
 use crate::snapshot::SessionSnapshot;
-use crate::transport::{Transport, TransportError};
+use crate::transport::{Connection, Transport, TransportError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -80,6 +82,72 @@ impl Client {
             ResponseResult::SessionSnapshot { snapshot } => Ok(snapshot),
             other => Err(ClientError::Protocol(format!(
                 "expected session_snapshot, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// An open `events.subscribe` connection.
+pub struct EventStream {
+    conn: Box<dyn Connection>,
+}
+
+impl std::fmt::Debug for EventStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventStream").finish_non_exhaustive()
+    }
+}
+
+impl EventStream {
+    /// The next event. `Ok(None)` at EOF. An error line from the server (for
+    /// example `events_lost`) is returned as `ClientError::Api`. Unparseable
+    /// lines are logged and skipped.
+    pub async fn next(&mut self) -> Result<Option<crate::protocol::Event>, ClientError> {
+        loop {
+            let Some(line) = self.conn.read_line().await? else {
+                return Ok(None);
+            };
+            match parse_line(&line) {
+                Ok(ServerLine::Event(event)) => return Ok(Some(event)),
+                Ok(ServerLine::Error { error, .. }) => return Err(ClientError::Api(error)),
+                Ok(ServerLine::Response { .. }) => {
+                    tracing::warn!(line = %line, "unexpected response on event stream; ignoring");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, line = %line, "skipping unparseable event line");
+                }
+            }
+        }
+    }
+}
+
+impl Client {
+    /// Open a subscription. The first line must be the `subscription_started`
+    /// ack; an error line means herdr rejected the whole request.
+    pub async fn subscribe(
+        &self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<EventStream, ClientError> {
+        let id = self.next_id();
+        let mut conn = self.transport.connect().await?;
+        conn.write_line(&encode_request(
+            &id,
+            &Method::EventsSubscribe(subscriptions),
+        ))
+        .await?;
+        let line = conn.read_line().await?.ok_or_else(|| {
+            ClientError::Protocol("connection closed before subscription ack".into())
+        })?;
+        match parse_line(&line).map_err(|e| {
+            ClientError::Protocol(format!("unparseable subscription ack: {e}: {line}"))
+        })? {
+            ServerLine::Response {
+                id: got,
+                result: ResponseResult::SubscriptionStarted,
+            } if got == id => Ok(EventStream { conn }),
+            ServerLine::Error { error, .. } => Err(ClientError::Api(error)),
+            other => Err(ClientError::Protocol(format!(
+                "expected subscription_started, got {other:?}"
             ))),
         }
     }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use herdr_client::client::{Client, ClientError};
-use herdr_client::protocol::{AgentStatus, Method, ResponseResult};
+use herdr_client::protocol::{AgentStatus, Event, Method, ResponseResult, Subscription};
 use herdr_client::test_support::{FakeHerdrServer, Reply};
 use herdr_client::transport::unix::UnixSocketTransport;
 
@@ -114,4 +114,90 @@ async fn not_running_transport_error_passes_through() {
         ),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn subscribe_acks_then_streams_events_until_eof() {
+    let server = FakeHerdrServer::start().await;
+    let client = client_for(&server);
+    let mut stream = client
+        .subscribe(vec![
+            Subscription::lifecycle("pane.closed"),
+            Subscription::pane_agent_status("w2:p1"),
+        ])
+        .await
+        .unwrap();
+    let sent = &server.requests()[0];
+    assert_eq!(sent["method"], "events.subscribe");
+    assert_eq!(sent["params"]["subscriptions"][1]["pane_id"], "w2:p1");
+
+    server.wait_for_subscribers(1).await;
+    server.push_json(serde_json::json!({"event":"pane.agent_status_changed","data":{"pane_id":"w2:p1","workspace_id":"w2","agent_status":"blocked","agent":"claude"}}));
+    server.push_json(serde_json::json!({"event":"workspace_renamed","data":{"type":"workspace_renamed","workspace_id":"w1","label":"x"}}));
+    server.push_json(serde_json::json!({"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p2","workspace_id":"w1"}}));
+
+    match stream.next().await.unwrap().unwrap() {
+        Event::PaneAgentStatusChanged(e) => assert_eq!(e.agent_status, AgentStatus::Blocked),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        Event::Other
+    ));
+    assert!(
+        matches!(stream.next().await.unwrap().unwrap(), Event::PaneClosed { pane_id, .. } if pane_id == "w1:p2")
+    );
+
+    server.close_subscriptions();
+    assert!(
+        stream.next().await.unwrap().is_none(),
+        "EOF after server closes"
+    );
+}
+
+#[tokio::test]
+async fn rejected_subscription_is_api_error() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| Reply::Error {
+        code: "invalid_request".into(),
+        message: "missing field `pane_id`".into(),
+    });
+    let err = client_for(&server)
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap_err();
+    assert_eq!(err.api_code(), Some("invalid_request"));
+}
+
+#[tokio::test]
+async fn events_lost_surfaces_as_api_error_from_next() {
+    let server = FakeHerdrServer::start().await;
+    let client = client_for(&server);
+    let mut stream = client
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap();
+    server.wait_for_subscribers(1).await;
+    server.push_line(
+        r#"{"id":"hs-1","error":{"code":"events_lost","message":"subscriber fell behind"}}"#,
+    );
+    let err = stream.next().await.unwrap_err();
+    assert_eq!(err.api_code(), Some("events_lost"));
+}
+
+#[tokio::test]
+async fn malformed_event_line_is_skipped_not_fatal() {
+    let server = FakeHerdrServer::start().await;
+    let client = client_for(&server);
+    let mut stream = client
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap();
+    server.wait_for_subscribers(1).await;
+    server.push_line("garbage line");
+    server.push_json(serde_json::json!({"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p2","workspace_id":"w1"}}));
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        Event::PaneClosed { .. }
+    ));
 }

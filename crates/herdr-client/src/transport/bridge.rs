@@ -37,6 +37,7 @@ pub struct BridgeTransport {
     command: ChildCommand,
     description: String,
     ready_timeout: Duration,
+    ready_marker: Option<&'static str>,
 }
 
 impl BridgeTransport {
@@ -45,7 +46,18 @@ impl BridgeTransport {
             command,
             description: description.into(),
             ready_timeout: Duration::from_secs(20),
+            ready_marker: Some(READY_MARKER),
         }
+    }
+
+    /// Do not wait for [`READY_MARKER`]: the JSON stream starts immediately.
+    ///
+    /// Use this when the command is `herdr … remote-api-bridge` run directly
+    /// (for example a local `herdr.exe`): herdr itself never prints the marker,
+    /// only the wrapping sh or PowerShell scripts do.
+    pub fn without_ready_marker(mut self) -> Self {
+        self.ready_marker = None;
+        self
     }
 
     pub fn with_ready_timeout(mut self, timeout: Duration) -> Self {
@@ -104,7 +116,13 @@ impl Transport for BridgeTransport {
         let collector = tokio::spawn(collect_stderr(stderr, Arc::clone(&stderr_buf)));
 
         let mut reader = BufReader::new(stdout);
-        match tokio::time::timeout(self.ready_timeout, skip_to_marker(&mut reader)).await {
+        let ready = match self.ready_marker {
+            Some(marker) => {
+                tokio::time::timeout(self.ready_timeout, skip_to_marker(&mut reader, marker)).await
+            }
+            None => Ok(Ok(true)),
+        };
+        match ready {
             Err(_elapsed) => Err(TransportError::Timeout(format!(
                 "{}: no ready marker within {:?}",
                 self.description, self.ready_timeout
@@ -159,7 +177,10 @@ enum SkipError {
 
 /// Returns `Ok(true)` once the marker line was consumed, `Ok(false)` at EOF.
 /// Works on bytes so non-UTF-8 banner text is simply discarded.
-async fn skip_to_marker(reader: &mut BufReader<ChildStdout>) -> Result<bool, SkipError> {
+async fn skip_to_marker(
+    reader: &mut BufReader<ChildStdout>,
+    marker: &str,
+) -> Result<bool, SkipError> {
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -171,7 +192,7 @@ async fn skip_to_marker(reader: &mut BufReader<ChildStdout>) -> Result<bool, Ski
         if n == 0 {
             return Ok(false);
         }
-        if line.trim_ascii_end() == READY_MARKER.as_bytes() {
+        if line.trim_ascii_end() == marker.as_bytes() {
             return Ok(true);
         }
         if line.last() != Some(&b'\n') {

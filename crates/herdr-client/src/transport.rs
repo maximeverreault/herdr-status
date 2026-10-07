@@ -22,6 +22,9 @@ pub enum TransportError {
     /// A child-process bridge failed to start or never printed its ready marker.
     #[error("bridge failed: {0}")]
     Launch(String),
+    /// Used both for a bridge that never printed its ready marker and for a
+    /// named pipe that stayed busy; the message says which, so callers should
+    /// display it.
     #[error("timed out: {0}")]
     Timeout(String),
     #[error("io error: {0}")]

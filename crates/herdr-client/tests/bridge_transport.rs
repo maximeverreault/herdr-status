@@ -150,3 +150,18 @@ async fn over_long_banner_without_newline_is_launch_error() {
         other => panic!("expected Launch error, got {:?}", other.map(|_| ())),
     }
 }
+
+#[tokio::test]
+async fn without_marker_bridges_immediately() {
+    let transport = BridgeTransport::new(
+        sh(r#"while IFS= read -r l; do echo "echo:$l"; done"#),
+        "test bridge",
+    )
+    .without_ready_marker();
+    let mut conn = transport.connect().await.unwrap();
+    conn.write_line("hello").await.unwrap();
+    assert_eq!(
+        conn.read_line().await.unwrap().as_deref(),
+        Some("echo:hello")
+    );
+}

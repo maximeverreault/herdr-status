@@ -21,16 +21,15 @@ const SNAPSHOT_FIXTURE: &str = include_str!("../tests/fixtures/snapshot.json");
 pub enum Reply {
     /// A success `result` object (must contain `"type"`).
     Result(Value),
-    Error {
-        code: String,
-        message: String,
-    },
+    /// An error response with the given code and message.
+    Error { code: String, message: String },
     /// Close the connection without writing anything.
     CloseSilently,
     /// Write exactly this line (no id handling) and close. For malformed-response tests.
     RawLine(String),
 }
 
+/// Decides the [`Reply`] for a request, given its method name and `params`.
 pub type Responder = Arc<dyn Fn(&str, &Value) -> Reply + Send + Sync>;
 
 struct Inner {
@@ -86,6 +85,7 @@ fn default_responder() -> Responder {
 }
 
 impl FakeHerdrServer {
+    /// Bind a fresh socket in a temp dir and start serving. Must run inside a tokio runtime.
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("herdr.sock");
@@ -141,10 +141,16 @@ impl FakeHerdrServer {
     }
 
     /// Push one raw line to every open subscription connection.
+    ///
+    /// A push with no registered subscriber is dropped, so call
+    /// [`wait_for_subscribers`](Self::wait_for_subscribers) first. The
+    /// broadcast buffer holds 64 lines; a subscriber that falls further behind
+    /// gets an `events_lost` error line and its connection is closed.
     pub fn push_line(&self, line: &str) {
         let _ = self.inner.pushed.send(line.to_string());
     }
 
+    /// Like [`push_line`](Self::push_line) with a JSON value; the same drop-without-subscriber caveat applies.
     pub fn push_json(&self, value: Value) {
         self.push_line(&value.to_string());
     }
@@ -154,6 +160,7 @@ impl FakeHerdrServer {
         self.inner.close.send_modify(|g| *g += 1);
     }
 
+    /// Number of subscription connections currently open.
     pub fn subscriber_count(&self) -> usize {
         self.inner.subscribers.load(Ordering::SeqCst)
     }
@@ -266,7 +273,12 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = w
+                        .write_all(b"{\"error\":{\"code\":\"events_lost\",\"message\":\"subscriber fell behind\"}}\n")
+                        .await;
+                    break;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             _ = closed.changed() => break,

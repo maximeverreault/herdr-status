@@ -168,3 +168,33 @@ async fn client_disconnect_is_noticed() {
     drop(w);
     timed(wait_for_zero_subscribers(&server)).await;
 }
+
+#[tokio::test]
+async fn lagging_subscriber_gets_events_lost_then_eof() {
+    let server = FakeHerdrServer::start().await;
+    let (mut reader, _w) = raw_subscribe(&server).await;
+    server.wait_for_subscribers(1).await;
+    for i in 0..100 {
+        server.push_line(&format!(r#"{{"event":"filler","n":{i}}}"#));
+    }
+    timed(async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).await.unwrap() > 0,
+                "EOF before events_lost"
+            );
+            if line.contains("events_lost") {
+                break;
+            }
+        }
+        line.clear();
+        assert_eq!(
+            reader.read_line(&mut line).await.unwrap(),
+            0,
+            "expected EOF after events_lost"
+        );
+    })
+    .await;
+}

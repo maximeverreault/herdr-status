@@ -4,3 +4,6 @@
 pub mod protocol;
 pub mod snapshot;
 pub mod transport;
+
+#[cfg(all(unix, feature = "test-support"))]
+pub mod test_support;

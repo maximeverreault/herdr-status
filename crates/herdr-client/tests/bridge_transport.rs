@@ -94,7 +94,7 @@ async fn non_utf8_banner_before_marker_is_skipped() {
 #[tokio::test]
 async fn bytes_after_marker_in_same_write_are_kept() {
     let script = format!(
-        r#"printf '\n%s\n{{"id":"1","result":{{"type":"ok"}}}}\n' '{READY_MARKER}'; sleep 1"#
+        r#"printf '\n%s\n{{"id":"1","result":{{"type":"ok"}}}}\n' '{READY_MARKER}'; exec sleep 1"#
     );
     let transport = BridgeTransport::new(sh(&script), "test bridge");
     let mut conn = transport.connect().await.unwrap();
@@ -114,7 +114,7 @@ async fn crlf_marker_is_accepted() {
 
 #[tokio::test]
 async fn text_before_marker_on_same_line_does_not_match() {
-    let script = format!(r#"printf 'MOTD %s\n' '{READY_MARKER}'; sleep 1"#);
+    let script = format!(r#"printf 'MOTD %s\n' '{READY_MARKER}'; exec sleep 1"#);
     let transport = BridgeTransport::new(sh(&script), "test bridge")
         .with_ready_timeout(Duration::from_millis(300));
     assert!(matches!(
@@ -136,4 +136,17 @@ async fn write_after_child_exit_is_io_error() {
         }
     }
     panic!("write never failed after child exit");
+}
+
+#[tokio::test]
+async fn over_long_banner_without_newline_is_launch_error() {
+    let transport = BridgeTransport::new(
+        sh(r#"head -c 70000 /dev/zero | tr '\0' a; exec sleep 1"#),
+        "test bridge",
+    )
+    .with_ready_timeout(Duration::from_secs(2));
+    match transport.connect().await {
+        Err(TransportError::Launch(msg)) => assert!(msg.contains("too long"), "{msg}"),
+        other => panic!("expected Launch error, got {:?}", other.map(|_| ())),
+    }
 }

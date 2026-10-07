@@ -115,6 +115,8 @@ impl Transport for BridgeTransport {
                 self.description
             ))),
             Ok(Ok(false)) => {
+                // Close stdin so a child blocked reading it sees EOF and exits.
+                drop(stdin);
                 let grace = Duration::from_millis(500);
                 let status = tokio::time::timeout(grace, child.wait())
                     .await

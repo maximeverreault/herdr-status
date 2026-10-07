@@ -27,6 +27,8 @@ pub enum Reply {
     },
     /// Close the connection without writing anything.
     CloseSilently,
+    /// Write exactly this line (no id handling) and close. For malformed-response tests.
+    RawLine(String),
 }
 
 pub type Responder = Arc<dyn Fn(&str, &Value) -> Reply + Send + Sync>;
@@ -234,6 +236,7 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
             }),
             false,
         ),
+        Reply::RawLine(line) => (Ok(line), false),
         Reply::CloseSilently => return,
     };
     let response = response.expect("envelope serialises");

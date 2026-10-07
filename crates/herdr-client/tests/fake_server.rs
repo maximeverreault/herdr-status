@@ -198,3 +198,28 @@ async fn lagging_subscriber_gets_events_lost_then_eof() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn close_after_burst_gives_plain_eof() {
+    let server = FakeHerdrServer::start().await;
+    let (mut reader, _w) = raw_subscribe(&server).await;
+    server.wait_for_subscribers(1).await;
+    for i in 0..100 {
+        server.push_line(&format!(r#"{{"event":"filler","n":{i}}}"#));
+    }
+    server.close_subscriptions();
+    timed(async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            assert!(
+                !line.contains("events_lost"),
+                "unexpected events_lost: {line}"
+            );
+        }
+    })
+    .await;
+}

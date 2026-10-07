@@ -267,6 +267,8 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
     let mut scratch = Vec::new();
     loop {
         tokio::select! {
+            biased;
+            _ = closed.changed() => break,
             msg = rx.recv() => match msg {
                 Ok(msg) => {
                     if w.write_all(format!("{msg}\n").as_bytes()).await.is_err() {
@@ -281,7 +283,6 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            _ = closed.changed() => break,
             read = reader.read_until(b'\n', &mut scratch) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(_) => scratch.clear(),

@@ -66,6 +66,16 @@ where
             buf: Vec::new(),
         }
     }
+
+    /// Wrap a reader that is already buffered (the bridge consumes leading
+    /// lines up to the ready marker and must not lose what is buffered).
+    pub fn from_buffered(reader: BufReader<R>, writer: W) -> Self {
+        Self {
+            reader,
+            writer,
+            buf: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]

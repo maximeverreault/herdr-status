@@ -154,17 +154,13 @@ reconcile_seconds = 30
         let cfg: Config = toml::from_str(text).map_err(|e| {
             let mut message = e.message().trim().to_string();
             if message.is_empty() {
-                message = e
-                    .to_string()
-                    .lines()
-                    .rev()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("")
-                    .to_string();
-            }
-            if message.is_empty() {
-                message = "syntax error".to_string();
+                let at_eof = e.span().is_none_or(|sp| sp.start >= text.len());
+                message = if at_eof {
+                    "unexpected end of file (a value is missing)"
+                } else {
+                    "syntax error"
+                }
+                .to_string();
             }
             ConfigError::Toml {
                 message,
@@ -205,7 +201,12 @@ reconcile_seconds = 30
         }
         for r in &self.remote {
             check_session(&r.label, &r.session)?;
-            if r.ssh_target.trim().is_empty() || r.ssh_target.starts_with('-') {
+            let t = r.ssh_target.trim();
+            if t.is_empty()
+                || t != r.ssh_target
+                || t.starts_with('-')
+                || t.chars().any(char::is_whitespace)
+            {
                 return Err(ConfigError::InvalidSshTarget(r.label.clone()));
             }
         }
@@ -381,7 +382,11 @@ reconcile_seconds = 10
     #[test]
     fn syntax_error_at_eof_has_a_message() {
         match Config::parse("[ui]\npeek_lines = ").unwrap_err() {
-            ConfigError::Toml { message, .. } => assert!(!message.trim().is_empty()),
+            ConfigError::Toml { message, line } => {
+                assert_eq!(line, Some(2));
+                assert_eq!(message, "unexpected end of file (a value is missing)");
+                assert!(!message.contains('|') && !message.contains('^'));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -492,7 +497,7 @@ reconcile_seconds = 10
 
     #[test]
     fn rejects_bad_ssh_targets() {
-        for bad in ["", "  ", "-oProxyCommand=x"] {
+        for bad in ["", "  ", "-oProxyCommand=x", " -oX", "host name"] {
             let text = format!("[[remote]]\nlabel = \"r\"\nssh_target = \"{bad}\"\n");
             let err = Config::parse(&text).unwrap_err();
             assert!(

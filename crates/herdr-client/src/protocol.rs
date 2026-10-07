@@ -177,6 +177,88 @@ pub fn parse_line(line: &str) -> Result<ServerLine, serde_json::Error> {
     serde_json::from_str(line)
 }
 
+/// A subscription entry for `events.subscribe`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Subscription {
+    Lifecycle {
+        r#type: String,
+    },
+    PaneAgentStatus {
+        r#type: &'static str,
+        pane_id: String,
+    },
+}
+
+impl Subscription {
+    /// A parameterless lifecycle subscription such as `pane.created`.
+    pub fn lifecycle(kind: &str) -> Self {
+        Subscription::Lifecycle {
+            r#type: kind.to_string(),
+        }
+    }
+
+    /// A per-pane status subscription. The pane must exist when the request is sent.
+    pub fn pane_agent_status(pane_id: &str) -> Self {
+        Subscription::PaneAgentStatus {
+            r#type: "pane.agent_status_changed",
+            pane_id: pane_id.to_string(),
+        }
+    }
+}
+
+/// Every API method the bar uses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Method {
+    Ping,
+    SessionSnapshot,
+    EventsSubscribe(Vec<Subscription>),
+    AgentRead { target: String, lines: u32 },
+    AgentSendKeys { target: String, keys: Vec<String> },
+    AgentPrompt { target: String, text: String },
+}
+
+impl Method {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Method::Ping => "ping",
+            Method::SessionSnapshot => "session.snapshot",
+            Method::EventsSubscribe(_) => "events.subscribe",
+            Method::AgentRead { .. } => "agent.read",
+            Method::AgentSendKeys { .. } => "agent.send_keys",
+            Method::AgentPrompt { .. } => "agent.prompt",
+        }
+    }
+
+    fn params(&self) -> serde_json::Value {
+        match self {
+            Method::Ping | Method::SessionSnapshot => serde_json::json!({}),
+            Method::EventsSubscribe(subs) => serde_json::json!({ "subscriptions": subs }),
+            Method::AgentRead { target, lines } => serde_json::json!({
+                "target": target,
+                "source": "recent_unwrapped",
+                "lines": lines,
+                "format": "text",
+                "strip_ansi": true,
+            }),
+            Method::AgentSendKeys { target, keys } => {
+                serde_json::json!({ "target": target, "keys": keys })
+            }
+            Method::AgentPrompt { target, text } => {
+                serde_json::json!({ "target": target, "text": text, "wait": null })
+            }
+        }
+    }
+}
+
+/// Encode a request as one JSON line, newline included.
+pub fn encode_request(id: &str, method: &Method) -> String {
+    let value = serde_json::json!({ "id": id, "method": method.name(), "params": method.params() });
+    let mut line = serde_json::to_string(&value).expect("request is valid JSON");
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +416,71 @@ mod tests {
         assert!(parse_line("not json").is_err());
         assert!(parse_line(r#"{"hello":"world"}"#).is_err());
         assert!(parse_line("").is_err());
+    }
+
+    fn encoded(method: &Method) -> serde_json::Value {
+        serde_json::from_str(&encode_request("hs-7", method)).unwrap()
+    }
+
+    #[test]
+    fn encodes_ping_and_snapshot() {
+        assert_eq!(
+            encoded(&Method::Ping),
+            serde_json::json!({"id":"hs-7","method":"ping","params":{}})
+        );
+        assert_eq!(
+            encoded(&Method::SessionSnapshot),
+            serde_json::json!({"id":"hs-7","method":"session.snapshot","params":{}})
+        );
+    }
+
+    #[test]
+    fn encodes_subscribe_with_lifecycle_and_per_pane_entries() {
+        let method = Method::EventsSubscribe(vec![
+            Subscription::lifecycle("pane.created"),
+            Subscription::pane_agent_status("w1:p1"),
+        ]);
+        assert_eq!(
+            encoded(&method),
+            serde_json::json!({"id":"hs-7","method":"events.subscribe","params":{"subscriptions":[
+                {"type":"pane.created"},
+                {"type":"pane.agent_status_changed","pane_id":"w1:p1"}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn encodes_agent_actions() {
+        let read = Method::AgentRead {
+            target: "w1:p1".into(),
+            lines: 30,
+        };
+        assert_eq!(
+            encoded(&read),
+            serde_json::json!({"id":"hs-7","method":"agent.read","params":{"target":"w1:p1","source":"recent_unwrapped","lines":30,"format":"text","strip_ansi":true}})
+        );
+        let keys = Method::AgentSendKeys {
+            target: "w1:p1".into(),
+            keys: vec!["ctrl+c".into()],
+        };
+        assert_eq!(
+            encoded(&keys),
+            serde_json::json!({"id":"hs-7","method":"agent.send_keys","params":{"target":"w1:p1","keys":["ctrl+c"]}})
+        );
+        let prompt = Method::AgentPrompt {
+            target: "w1:p1".into(),
+            text: "continue".into(),
+        };
+        assert_eq!(
+            encoded(&prompt),
+            serde_json::json!({"id":"hs-7","method":"agent.prompt","params":{"target":"w1:p1","text":"continue","wait":null}})
+        );
+    }
+
+    #[test]
+    fn encoded_request_is_one_line_with_newline() {
+        let s = encode_request("a", &Method::Ping);
+        assert!(s.ends_with('\n'));
+        assert_eq!(s.matches('\n').count(), 1);
     }
 }

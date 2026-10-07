@@ -11,6 +11,7 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// Windows on Windows hosts; every other host maps to `Mac` (Linux is out of scope).
     pub fn current() -> Self {
         if cfg!(windows) {
             Platform::Windows
@@ -39,6 +40,7 @@ impl Env {
         }
     }
 
+    /// Looks up a variable; empty values count as unset.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.vars
             .get(key)
@@ -78,6 +80,8 @@ pub fn herdr_socket_path(env: &Env, platform: Platform, session: &str) -> PathBu
 }
 
 /// The same rule as a POSIX shell expression, for probing inside WSL.
+/// Assumes `session` was validated (see `Config::validate`); the caller must
+/// place the result inside double quotes so the variables expand.
 pub fn posix_socket_probe_path(session: &str) -> String {
     if session == "default" {
         "${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock".to_string()
@@ -271,6 +275,15 @@ mod tests {
         assert_eq!(
             posix_socket_probe_path("work"),
             "${XDG_CONFIG_HOME:-$HOME/.config}/herdr/sessions/work/herdr.sock"
+        );
+    }
+
+    #[test]
+    fn windows_named_session_socket_path() {
+        let w = env(&[("APPDATA", r"C:\Users\me\AppData\Roaming")]);
+        assert_eq!(
+            herdr_socket_path(&w, Platform::Windows, "work").to_string_lossy(),
+            r"C:\Users\me\AppData\Roaming\herdr\sessions\work\herdr.sock"
         );
     }
 }

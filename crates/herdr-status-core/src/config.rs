@@ -114,6 +114,14 @@ pub enum ConfigError {
     ReservedLabel(String),
     #[error("a server label is empty")]
     EmptyLabel,
+    #[error("invalid server label '{0}' (no surrounding spaces or control characters)")]
+    InvalidLabel(String),
+    #[error("server '{server}': invalid session name '{session}' (use letters, digits, '.', '_' or '-')")]
+    InvalidSession { server: String, session: String },
+    #[error("server '{0}': ssh_target must be a host, alias or user@host")]
+    InvalidSshTarget(String),
+    #[error("ui.{key}: {message}")]
+    InvalidValue { key: String, message: String },
 }
 
 impl Config {
@@ -143,11 +151,27 @@ reconcile_seconds = 30
 "#;
 
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
-        let cfg: Config = toml::from_str(text).map_err(|e| ConfigError::Toml {
-            message: e.message().to_string(),
-            line: e
-                .span()
-                .map(|span| text[..span.start].matches('\n').count() + 1),
+        let cfg: Config = toml::from_str(text).map_err(|e| {
+            let mut message = e.message().trim().to_string();
+            if message.is_empty() {
+                message = e
+                    .to_string()
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if message.is_empty() {
+                message = "syntax error".to_string();
+            }
+            ConfigError::Toml {
+                message,
+                line: e
+                    .span()
+                    .map(|span| text[..span.start].matches('\n').count() + 1),
+            }
         })?;
         cfg.validate()?;
         Ok(cfg)
@@ -164,12 +188,38 @@ reconcile_seconds = 30
             if label.trim().is_empty() {
                 return Err(ConfigError::EmptyLabel);
             }
-            if label == LOCAL_SERVER_ID {
+            if label.trim() != label || label.chars().any(char::is_control) {
+                return Err(ConfigError::InvalidLabel(label.clone()));
+            }
+            let folded = label.to_lowercase();
+            if folded == LOCAL_SERVER_ID {
                 return Err(ConfigError::ReservedLabel(label.clone()));
             }
-            if !seen.insert(label.clone()) {
+            if !seen.insert(folded) {
                 return Err(ConfigError::DuplicateLabel(label.clone()));
             }
+        }
+        check_session(LOCAL_SERVER_ID, &self.local.session)?;
+        for w in &self.wsl {
+            check_session(&w.label, &w.session)?;
+        }
+        for r in &self.remote {
+            check_session(&r.label, &r.session)?;
+            if r.ssh_target.trim().is_empty() || r.ssh_target.starts_with('-') {
+                return Err(ConfigError::InvalidSshTarget(r.label.clone()));
+            }
+        }
+        if !(1..=500).contains(&self.ui.peek_lines) {
+            return Err(ConfigError::InvalidValue {
+                key: "peek_lines".into(),
+                message: "must be between 1 and 500".into(),
+            });
+        }
+        if self.ui.reconcile_seconds < 1 {
+            return Err(ConfigError::InvalidValue {
+                key: "reconcile_seconds".into(),
+                message: "must be at least 1".into(),
+            });
         }
         Ok(())
     }
@@ -185,10 +235,30 @@ reconcile_seconds = 30
         ids
     }
 
+    /// Serialises the config. Panics only for non-UTF-8 paths; configs built
+    /// by `parse` are always serialisable.
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("config serialises")
     }
 }
+/// Sessions end up in socket paths and shell command lines, so keep them tame.
+fn check_session(server: &str, session: &str) -> Result<(), ConfigError> {
+    let ok = !session.is_empty()
+        && session != "."
+        && session != ".."
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidSession {
+            server: server.to_string(),
+            session: session.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +376,148 @@ reconcile_seconds = 10
             Config::parse(broken).unwrap_err(),
             ConfigError::Toml { line: Some(1), .. }
         ));
+    }
+
+    #[test]
+    fn syntax_error_at_eof_has_a_message() {
+        match Config::parse("[ui]\npeek_lines = ").unwrap_err() {
+            ConfigError::Toml { message, .. } => assert!(!message.trim().is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_toml_round_trips_every_optional_field() {
+        let cfg = Config {
+            local: LocalConfig {
+                enabled: true,
+                session: "work".into(),
+                socket_path: Some("/tmp/x.sock".into()),
+            },
+            wsl: vec![WslConfig {
+                label: "ubuntu".into(),
+                distro: Some("Ubuntu".into()),
+                session: "s1".into(),
+            }],
+            remote: vec![
+                RemoteConfig {
+                    label: "a".into(),
+                    ssh_target: "me@a".into(),
+                    session: "s2".into(),
+                    os: Some(RemoteOs::Windows),
+                    herdr_path: Some("C:\\herdr.exe".into()),
+                },
+                RemoteConfig {
+                    label: "b".into(),
+                    ssh_target: "b".into(),
+                    session: "default".into(),
+                    os: None,
+                    herdr_path: None,
+                },
+            ],
+            ui: UiConfig {
+                peek_lines: 12,
+                reconcile_seconds: 5,
+            },
+        };
+        let text = cfg.to_toml();
+        assert!(
+            text.contains("[[remote]]") && text.contains("[[wsl]]"),
+            "{text}"
+        );
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+    }
+
+    #[test]
+    fn default_round_trips() {
+        let cfg = Config::default();
+        assert_eq!(Config::parse(&cfg.to_toml()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn server_ids_with_local_disabled_and_remotes() {
+        let text = "[local]\nenabled = false\n[[remote]]\nlabel = \"r\"\nssh_target = \"r\"\n";
+        assert_eq!(Config::parse(text).unwrap().server_ids(), vec!["r"]);
+    }
+
+    #[test]
+    fn rejects_invalid_session_names() {
+        for bad in ["a/b", "", "..", ".", "a b", "a\\\"b", "$x"] {
+            let text = format!(
+                "[local]\nsession = \"{}\"\n",
+                bad.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            let err = Config::parse(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidSession { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = Config::parse("[[wsl]]\nlabel = \"u\"\nsession = \"a/b\"\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "server 'u': invalid session name 'a/b' (use letters, digits, '.', '_' or '-')"
+        );
+        assert!(Config::parse("[local]\nsession = \"my-work_1.x\"\n").is_ok());
+    }
+
+    #[test]
+    fn rejects_untidy_labels_and_compares_case_insensitively() {
+        let spaced = "[[wsl]]\nlabel = \" box\"\n";
+        assert!(matches!(
+            Config::parse(spaced).unwrap_err(),
+            ConfigError::InvalidLabel(_)
+        ));
+        let ctrl = "[[wsl]]\nlabel = \"a\\u0007b\"\n";
+        assert!(matches!(
+            Config::parse(ctrl).unwrap_err(),
+            ConfigError::InvalidLabel(_)
+        ));
+        let blank = "[[wsl]]\nlabel = \"  \"\n";
+        assert!(matches!(
+            Config::parse(blank).unwrap_err(),
+            ConfigError::EmptyLabel
+        ));
+        let upper = "[[wsl]]\nlabel = \"LOCAL\"\n";
+        assert!(matches!(
+            Config::parse(upper).unwrap_err(),
+            ConfigError::ReservedLabel(_)
+        ));
+        let dup = "[[wsl]]\nlabel = \"Box\"\n[[remote]]\nlabel = \"box\"\nssh_target = \"x\"\n";
+        assert!(matches!(
+            Config::parse(dup).unwrap_err(),
+            ConfigError::DuplicateLabel(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_ssh_targets() {
+        for bad in ["", "  ", "-oProxyCommand=x"] {
+            let text = format!("[[remote]]\nlabel = \"r\"\nssh_target = \"{bad}\"\n");
+            let err = Config::parse(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidSshTarget(ref l) if l == "r"),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "server 'r': ssh_target must be a host, alias or user@host"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_ui_values() {
+        for (text, key) in [
+            ("[ui]\npeek_lines = 0\n", "peek_lines"),
+            ("[ui]\npeek_lines = 501\n", "peek_lines"),
+            ("[ui]\nreconcile_seconds = 0\n", "reconcile_seconds"),
+        ] {
+            match Config::parse(text).unwrap_err() {
+                ConfigError::InvalidValue { key: k, .. } => assert_eq!(k, key),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(Config::parse("[ui]\npeek_lines = 500\nreconcile_seconds = 1\n").is_ok());
     }
 }

@@ -55,8 +55,11 @@ async fn child_exit_before_marker_is_launch_error_with_stderr() {
 
 #[tokio::test]
 async fn no_marker_within_timeout_is_timeout_error() {
-    let transport = BridgeTransport::new(sh(r#"echo "still negotiating"; sleep 5"#), "test bridge")
-        .with_ready_timeout(Duration::from_millis(300));
+    let transport = BridgeTransport::new(
+        sh(r#"echo "still negotiating"; exec sleep 5"#),
+        "test bridge",
+    )
+    .with_ready_timeout(Duration::from_millis(300));
     assert!(matches!(
         transport.connect().await,
         Err(TransportError::Timeout(_))
@@ -75,4 +78,62 @@ async fn missing_program_is_launch_error() {
         Err(TransportError::Launch(_))
     ));
     assert_eq!(transport.describe(), "nope");
+}
+
+#[tokio::test]
+async fn non_utf8_banner_before_marker_is_skipped() {
+    let script = format!(
+        r#"printf '\377\376 banner\n'; printf '\n%s\n' '{READY_MARKER}'; while IFS= read -r l; do echo "echo:$l"; done"#
+    );
+    let transport = BridgeTransport::new(sh(&script), "test bridge");
+    let mut conn = transport.connect().await.unwrap();
+    conn.write_line("hi").await.unwrap();
+    assert_eq!(conn.read_line().await.unwrap().as_deref(), Some("echo:hi"));
+}
+
+#[tokio::test]
+async fn bytes_after_marker_in_same_write_are_kept() {
+    let script = format!(
+        r#"printf '\n%s\n{{"id":"1","result":{{"type":"ok"}}}}\n' '{READY_MARKER}'; sleep 1"#
+    );
+    let transport = BridgeTransport::new(sh(&script), "test bridge");
+    let mut conn = transport.connect().await.unwrap();
+    assert_eq!(
+        conn.read_line().await.unwrap().as_deref(),
+        Some(r#"{"id":"1","result":{"type":"ok"}}"#)
+    );
+}
+
+#[tokio::test]
+async fn crlf_marker_is_accepted() {
+    let script = format!(r#"printf '%s\r\n' '{READY_MARKER}'; echo after"#);
+    let transport = BridgeTransport::new(sh(&script), "test bridge");
+    let mut conn = transport.connect().await.unwrap();
+    assert_eq!(conn.read_line().await.unwrap().as_deref(), Some("after"));
+}
+
+#[tokio::test]
+async fn text_before_marker_on_same_line_does_not_match() {
+    let script = format!(r#"printf 'MOTD %s\n' '{READY_MARKER}'; sleep 1"#);
+    let transport = BridgeTransport::new(sh(&script), "test bridge")
+        .with_ready_timeout(Duration::from_millis(300));
+    assert!(matches!(
+        transport.connect().await,
+        Err(TransportError::Timeout(_))
+    ));
+}
+
+#[tokio::test]
+async fn write_after_child_exit_is_io_error() {
+    let script = format!(r#"printf '\n%s\n' '{READY_MARKER}'; exit 0"#);
+    let transport = BridgeTransport::new(sh(&script), "test bridge");
+    let mut conn = transport.connect().await.unwrap();
+    for _ in 0..50 {
+        match conn.write_line("x").await {
+            Err(TransportError::Io(_)) => return,
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    panic!("write never failed after child exit");
 }

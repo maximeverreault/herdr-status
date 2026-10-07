@@ -39,10 +39,13 @@ impl Transport for NamedPipeTransport {
                     return Ok(Box::new(StreamConnection::new(r, w)));
                 }
                 // The pipe exists but the server is between accepts: retry briefly.
-                Err(e)
-                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
-                        && Instant::now() < deadline =>
-                {
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    if Instant::now() >= deadline {
+                        return Err(TransportError::Timeout(format!(
+                            "{}: pipe busy for 2 s",
+                            self.pipe_name
+                        )));
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {

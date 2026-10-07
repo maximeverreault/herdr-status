@@ -57,7 +57,7 @@ pub struct UiConfig {
     pub reconcile_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -97,16 +97,6 @@ impl Default for UiConfig {
         Self {
             peek_lines: default_peek_lines(),
             reconcile_seconds: default_reconcile_seconds(),
-        }
-    }
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            local: LocalConfig::default(),
-            wsl: Vec::new(),
-            remote: Vec::new(),
-            ui: UiConfig::default(),
         }
     }
 }

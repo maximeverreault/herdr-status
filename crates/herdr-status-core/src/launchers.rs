@@ -108,7 +108,7 @@ for candidate in $candidates; do
     esac
     [ -x "$candidate" ] || continue
     if capability=$("$candidate" --session {session} remote-api-bridge --check </dev/null 2>/dev/null) && [ "$capability" = {BRIDGE_CAPABILITY} ]; then
-        printf '%s\n' "$candidate"
+        printf 'herdr-status-discovery:%s\n' "$candidate"
         exit 0
     fi
 done
@@ -141,7 +141,7 @@ pub fn windows_discovery_script(session: &str) -> String {
         "$candidates = @(); $cmd = Get-Command herdr.exe -ErrorAction SilentlyContinue; if ($cmd) {{ $candidates += $cmd.Source }}; \
 $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\\Herdr\\bin\\herdr.exe'); \
 foreach ($c in $candidates) {{ if (Test-Path $c) {{ $cap = & $c --session {session} remote-api-bridge --check 2>$null; \
-if ($LASTEXITCODE -eq 0 -and $cap -eq '{BRIDGE_CAPABILITY}') {{ [Console]::Out.WriteLine($c); exit 0 }} }} }}; \
+if ($LASTEXITCODE -eq 0 -and $cap -eq '{BRIDGE_CAPABILITY}') {{ [Console]::Out.WriteLine('herdr-status-discovery:' + $c); exit 0 }} }} }}; \
 [Console]::Error.WriteLine('herdr not found or too old on this host'); exit 2"
     )
 }
@@ -359,6 +359,7 @@ mod tests {
         }
         assert!(s.contains("--session default remote-api-bridge --check"));
         assert!(s.contains("= herdr-api-bridge-v1"));
+        assert!(s.contains("printf 'herdr-status-discovery:%s\\n' \"$candidate\""));
         assert!(s.contains("*/mise/shims/herdr) continue"));
         assert!(s.ends_with("exit 2"));
 
@@ -367,6 +368,7 @@ mod tests {
         assert!(w.contains(r"Programs\Herdr\bin\herdr.exe"));
         assert!(w.contains("--session default remote-api-bridge --check"));
         assert!(w.contains("'herdr-api-bridge-v1'"));
+        assert!(w.contains("[Console]::Out.WriteLine('herdr-status-discovery:' + $c)"));
     }
 
     #[test]

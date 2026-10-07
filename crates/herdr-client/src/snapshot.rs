@@ -55,6 +55,7 @@ pub struct PaneInfo {
     pub terminal_title_stripped: Option<String>,
 }
 
+/// A herdr workspace: an id and its display label.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WorkspaceInfo {
     pub workspace_id: String,

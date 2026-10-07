@@ -14,11 +14,13 @@ use crate::snapshot::{PaneInfo, ReadResult, SessionSnapshot};
 )]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
+    // Do not reorder: the urgency sort depends on declaration order.
     Blocked,
     Working,
     Done,
     Idle,
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -164,12 +166,43 @@ impl<'de> Deserialize<'de> for Event {
 }
 
 /// One decoded line from the server.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ServerLine {
     Response { id: String, result: ResponseResult },
     Error { id: String, error: ErrorBody },
     Event(Event),
+}
+
+impl<'de> Deserialize<'de> for ServerLine {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut map = serde_json::Map::deserialize(deserializer)?;
+        if map.contains_key("event") {
+            let event =
+                serde_json::from_value(serde_json::Value::Object(map)).map_err(D::Error::custom)?;
+            return Ok(ServerLine::Event(event));
+        }
+        let id =
+            |map: &mut serde_json::Map<String, serde_json::Value>| -> Result<String, D::Error> {
+                let value = map
+                    .remove("id")
+                    .ok_or_else(|| D::Error::missing_field("id"))?;
+                serde_json::from_value(value).map_err(D::Error::custom)
+            };
+        if let Some(error) = map.remove("error") {
+            return Ok(ServerLine::Error {
+                id: id(&mut map)?,
+                error: serde_json::from_value(error).map_err(D::Error::custom)?,
+            });
+        }
+        if let Some(result) = map.remove("result") {
+            return Ok(ServerLine::Response {
+                id: id(&mut map)?,
+                result: serde_json::from_value(result).map_err(D::Error::custom)?,
+            });
+        }
+        Err(D::Error::custom("line has none of result, error or event"))
+    }
 }
 
 /// Parse one line (without its trailing newline) from the server.
@@ -179,35 +212,31 @@ pub fn parse_line(line: &str) -> Result<ServerLine, serde_json::Error> {
 
 /// A subscription entry for `events.subscribe`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum Subscription {
-    Lifecycle {
-        r#type: String,
-    },
-    PaneAgentStatus {
-        r#type: &'static str,
-        pane_id: String,
-    },
+pub struct Subscription {
+    r#type: std::borrow::Cow<'static, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_id: Option<String>,
 }
 
 impl Subscription {
     /// A parameterless lifecycle subscription such as `pane.created`.
     pub fn lifecycle(kind: &str) -> Self {
-        Subscription::Lifecycle {
-            r#type: kind.to_string(),
+        Subscription {
+            r#type: kind.to_string().into(),
+            pane_id: None,
         }
     }
 
     /// A per-pane status subscription. The pane must exist when the request is sent.
     pub fn pane_agent_status(pane_id: &str) -> Self {
-        Subscription::PaneAgentStatus {
-            r#type: "pane.agent_status_changed",
-            pane_id: pane_id.to_string(),
+        Subscription {
+            r#type: "pane.agent_status_changed".into(),
+            pane_id: Some(pane_id.to_string()),
         }
     }
 }
 
-/// Every API method the bar uses.
+/// API methods this client can send.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Method {
     Ping,
@@ -219,6 +248,7 @@ pub enum Method {
 }
 
 impl Method {
+    /// The `method` string sent on the wire.
     pub fn name(&self) -> &'static str {
         match self {
             Method::Ping => "ping",
@@ -254,6 +284,7 @@ impl Method {
 /// Encode a request as one JSON line, newline included.
 pub fn encode_request(id: &str, method: &Method) -> String {
     let value = serde_json::json!({ "id": id, "method": method.name(), "params": method.params() });
+    // Serialising a `serde_json::Value` cannot fail.
     let mut line = serde_json::to_string(&value).expect("request is valid JSON");
     line.push('\n');
     line
@@ -482,5 +513,32 @@ mod tests {
         let s = encode_request("a", &Method::Ping);
         assert!(s.ends_with('\n'));
         assert_eq!(s.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn unknown_status_string_is_unknown() {
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"waiting\"").unwrap(),
+            AgentStatus::Unknown
+        );
+        let json = r#"{"version":"1","protocol":22,"agents":[{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"waiting"}]}"#;
+        let s: crate::snapshot::SessionSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(s.agents[0].agent_status, AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn malformed_known_event_payload_is_an_error() {
+        let line = r#"{"event":"pane_closed","data":{"type":"pane_closed"}}"#;
+        let err = parse_line(line).unwrap_err();
+        assert!(err.to_string().contains("pane_id"), "{err}");
+    }
+
+    #[test]
+    fn known_event_with_extra_keys_parses() {
+        let line = r#"{"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p2","workspace_id":"w1","future":1}}"#;
+        assert!(matches!(
+            parse_line(line).unwrap(),
+            ServerLine::Event(Event::PaneClosed { .. })
+        ));
     }
 }

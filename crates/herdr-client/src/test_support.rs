@@ -11,12 +11,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::transport::unix::UnixSocketTransport;
 
 const SNAPSHOT_FIXTURE: &str = include_str!("../tests/fixtures/snapshot.json");
-const CLOSE_SENTINEL: &str = "\u{0}close\u{0}";
 
 /// What the fake answers for one request.
 pub enum Reply {
@@ -37,6 +36,17 @@ struct Inner {
     requests: Mutex<Vec<Value>>,
     pushed: broadcast::Sender<String>,
     subscribers: AtomicUsize,
+    /// Close generation: bumping it makes every open subscription loop exit.
+    close: watch::Sender<u64>,
+}
+
+/// Decrements the subscriber count on every exit path of a subscription.
+struct SubscriberGuard(Arc<Inner>);
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.0.subscribers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct FakeHerdrServer {
@@ -77,13 +87,20 @@ impl FakeHerdrServer {
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("herdr.sock");
-        let listener = UnixListener::bind(&path).expect("bind fake socket");
+        let listener = UnixListener::bind(&path).unwrap_or_else(|e| {
+            panic!(
+                "bind fake socket {} ({} bytes; macOS limits sun_path to 104): {e}",
+                path.display(),
+                path.as_os_str().len()
+            )
+        });
         let (pushed, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             responder: Mutex::new(default_responder()),
             requests: Mutex::new(Vec::new()),
             pushed,
             subscribers: AtomicUsize::new(0),
+            close: watch::channel(0).0,
         });
         let accept_inner = Arc::clone(&inner);
         let task = tokio::spawn(async move {
@@ -110,7 +127,8 @@ impl FakeHerdrServer {
         UnixSocketTransport::new(&self.path)
     }
 
-    /// Replace the responder for all later requests.
+    /// Replace the responder; it applies to requests received after this call.
+    /// A panic inside a responder only shows up to the client as EOF.
     pub fn set_responder(&self, f: impl Fn(&str, &Value) -> Reply + Send + Sync + 'static) {
         *self.inner.responder.lock().unwrap() = Arc::new(f);
     }
@@ -131,7 +149,7 @@ impl FakeHerdrServer {
 
     /// Close every open subscription connection (simulates herdr dropping the stream).
     pub fn close_subscriptions(&self) {
-        let _ = self.inner.pushed.send(CLOSE_SENTINEL.to_string());
+        self.inner.close.send_modify(|g| *g += 1);
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -153,6 +171,7 @@ impl FakeHerdrServer {
 impl Drop for FakeHerdrServer {
     fn drop(&mut self) {
         self.task.abort();
+        self.inner.close.send_modify(|g| *g += 1);
     }
 }
 
@@ -185,13 +204,15 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
     let request: Value = match serde_json::from_str(line.trim_end()) {
         Ok(v) => v,
         Err(e) => {
-            let _ = w
-                .write_all(
-                    format!(r#"{{"id":"","error":{{"code":"invalid_request","message":"{e}"}}}}"#)
-                        .as_bytes(),
-                )
-                .await;
-            let _ = w.write_all(b"\n").await;
+            let reply = ErrorEnvelope {
+                id: "",
+                error: ErrorFields {
+                    code: "invalid_request".into(),
+                    message: e.to_string(),
+                },
+            };
+            let body = serde_json::to_string(&reply).expect("envelope serialises");
+            let _ = w.write_all(format!("{body}\n").as_bytes()).await;
             return;
         }
     };
@@ -216,28 +237,40 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
         Reply::CloseSilently => return,
     };
     let response = response.expect("envelope serialises");
+    // Register before the ack so every push after the client reads it is delivered.
+    let subscription = keep_open.then(|| {
+        let rx = inner.pushed.subscribe();
+        let mut closed = inner.close.subscribe();
+        closed.borrow_and_update();
+        inner.subscribers.fetch_add(1, Ordering::SeqCst);
+        (rx, closed, SubscriberGuard(Arc::clone(&inner)))
+    });
     if w.write_all(format!("{response}\n").as_bytes())
         .await
         .is_err()
     {
         return;
     }
-    if !keep_open {
+    let Some((mut rx, mut closed, _guard)) = subscription else {
         return;
-    }
-    let mut rx = inner.pushed.subscribe();
-    inner.subscribers.fetch_add(1, Ordering::SeqCst);
+    };
+    let mut scratch = Vec::new();
     loop {
-        match rx.recv().await {
-            Ok(msg) if msg == CLOSE_SENTINEL => break,
-            Ok(msg) => {
-                if w.write_all(format!("{msg}\n").as_bytes()).await.is_err() {
-                    break;
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(msg) => {
+                    if w.write_all(format!("{msg}\n").as_bytes()).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = closed.changed() => break,
+            read = reader.read_until(b'\n', &mut scratch) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => scratch.clear(),
+            },
         }
     }
-    inner.subscribers.fetch_sub(1, Ordering::SeqCst);
 }

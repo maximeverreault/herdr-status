@@ -2,8 +2,44 @@
 #![cfg(all(unix, feature = "test-support"))]
 
 use herdr_client::test_support::{FakeHerdrServer, Reply};
+use std::future::Future;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+async fn timed<T>(fut: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("timed out")
+}
+
+/// Opens a raw subscription and returns the reader half (ack already consumed) and the writer half.
+async fn raw_subscribe(
+    server: &FakeHerdrServer,
+) -> (
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let stream = UnixStream::connect(server.socket_path()).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    w.write_all(br#"{"id":"sub","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"}]}}"#).await.unwrap();
+    w.write_all(b"\n").await.unwrap();
+    let mut reader = BufReader::new(r);
+    let mut ack = String::new();
+    reader.read_line(&mut ack).await.unwrap();
+    assert!(ack.contains("subscription_started"));
+    (reader, w)
+}
+
+async fn wait_for_zero_subscribers(server: &FakeHerdrServer) {
+    for _ in 0..100 {
+        if server.subscriber_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("subscriber_count stayed at {}", server.subscriber_count());
+}
 
 async fn raw_exchange(server: &FakeHerdrServer, request: &str) -> Vec<String> {
     let stream = UnixStream::connect(server.socket_path()).await.unwrap();
@@ -25,7 +61,11 @@ async fn raw_exchange(server: &FakeHerdrServer, request: &str) -> Vec<String> {
 #[tokio::test]
 async fn answers_ping_then_closes() {
     let server = FakeHerdrServer::start().await;
-    let lines = raw_exchange(&server, r#"{"id":"a","method":"ping","params":{}}"#).await;
+    let lines = timed(raw_exchange(
+        &server,
+        r#"{"id":"a","method":"ping","params":{}}"#,
+    ))
+    .await;
     assert_eq!(lines.len(), 1, "one response then EOF");
     assert!(lines[0].contains(r#""type":"pong""#));
     assert_eq!(server.requests().len(), 1);
@@ -74,13 +114,13 @@ async fn subscription_stays_open_and_receives_pushed_lines() {
     w.write_all(b"\n").await.unwrap();
     let mut reader = BufReader::new(r);
     let mut ack = String::new();
-    reader.read_line(&mut ack).await.unwrap();
+    timed(reader.read_line(&mut ack)).await.unwrap();
     assert!(ack.contains("subscription_started"));
 
-    server.wait_for_subscribers(1).await;
+    timed(server.wait_for_subscribers(1)).await;
     server.push_json(serde_json::json!({"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p2","workspace_id":"w1"}}));
     let mut event = String::new();
-    reader.read_line(&mut event).await.unwrap();
+    timed(reader.read_line(&mut event)).await.unwrap();
     assert!(event.contains(r#""event":"pane_closed""#));
 
     server.close_subscriptions();
@@ -90,4 +130,41 @@ async fn subscription_stays_open_and_receives_pushed_lines() {
         0,
         "closed by server"
     );
+}
+
+#[tokio::test]
+async fn dropping_server_closes_open_subscription() {
+    let server = FakeHerdrServer::start().await;
+    let (mut reader, _w) = timed(raw_subscribe(&server)).await;
+    timed(server.wait_for_subscribers(1)).await;
+    drop(server);
+    let mut end = String::new();
+    assert_eq!(
+        timed(reader.read_line(&mut end)).await.unwrap(),
+        0,
+        "EOF after server drop"
+    );
+}
+
+#[tokio::test]
+async fn close_subscriptions_closes_every_subscriber_and_count_returns_to_zero() {
+    let server = FakeHerdrServer::start().await;
+    let (mut r1, _w1) = timed(raw_subscribe(&server)).await;
+    let (mut r2, _w2) = timed(raw_subscribe(&server)).await;
+    timed(server.wait_for_subscribers(2)).await;
+    server.close_subscriptions();
+    let mut l = String::new();
+    assert_eq!(timed(r1.read_line(&mut l)).await.unwrap(), 0);
+    assert_eq!(timed(r2.read_line(&mut l)).await.unwrap(), 0);
+    timed(wait_for_zero_subscribers(&server)).await;
+}
+
+#[tokio::test]
+async fn client_disconnect_is_noticed() {
+    let server = FakeHerdrServer::start().await;
+    let (reader, w) = timed(raw_subscribe(&server)).await;
+    timed(server.wait_for_subscribers(1)).await;
+    drop(reader);
+    drop(w);
+    timed(wait_for_zero_subscribers(&server)).await;
 }

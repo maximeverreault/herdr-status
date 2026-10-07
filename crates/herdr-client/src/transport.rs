@@ -32,6 +32,7 @@ pub enum TransportError {
 pub trait Connection: Send {
     async fn write_line(&mut self, line: &str) -> Result<(), TransportError>;
     /// The next line without its trailing newline, or `None` at EOF.
+    /// Invalid UTF-8 is replaced lossily rather than failing the stream.
     async fn read_line(&mut self) -> Result<Option<String>, TransportError>;
 }
 
@@ -77,14 +78,52 @@ where
     }
 
     async fn read_line(&mut self) -> Result<Option<String>, TransportError> {
-        let mut buf = String::new();
-        let n = self.reader.read_line(&mut buf).await?;
+        let mut buf = Vec::new();
+        let n = self.reader.read_until(b'\n', &mut buf).await?;
         if n == 0 {
             return Ok(None);
         }
-        while buf.ends_with('\n') || buf.ends_with('\r') {
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
         }
-        Ok(Some(buf))
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(input: &'static [u8]) -> StreamConnection<&'static [u8], Vec<u8>> {
+        StreamConnection::new(input, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn final_line_without_newline_then_eof() {
+        let mut c = conn(b"one\ntwo");
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("one"));
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("two"));
+        assert_eq!(c.read_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn crlf_is_stripped() {
+        let mut c = conn(b"one\r\n");
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("one"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_decoded_lossily() {
+        let mut c = conn(b"a\xffb\nnext\n");
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("a\u{fffd}b"));
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("next"));
+    }
+
+    #[tokio::test]
+    async fn write_line_appends_newline_only_when_missing() {
+        let mut c = conn(b"");
+        c.write_line("a").await.unwrap();
+        c.write_line("b\n").await.unwrap();
+        assert_eq!(c.writer, b"a\nb\n");
     }
 }

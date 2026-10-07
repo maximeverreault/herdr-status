@@ -1,0 +1,10 @@
+# build outputs
+target/
+node_modules/
+ui/dist/
+
+# brainstorming companion sessions
+.superpowers/
+
+# OS
+.DS_Store

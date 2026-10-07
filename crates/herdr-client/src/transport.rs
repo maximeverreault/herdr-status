@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 pub mod bridge;
 #[cfg(windows)]
 pub mod named_pipe;
+pub mod pipe_name;
 #[cfg(unix)]
 pub mod unix;
 

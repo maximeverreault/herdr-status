@@ -3,4 +3,5 @@
 pub mod config;
 pub mod launchers;
 pub mod paths;
+pub mod remote_connect;
 pub mod remote_probe;

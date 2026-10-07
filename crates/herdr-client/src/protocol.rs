@@ -168,8 +168,15 @@ impl<'de> Deserialize<'de> for Event {
 /// One decoded line from the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerLine {
-    Response { id: String, result: ResponseResult },
-    Error { id: String, error: ErrorBody },
+    Response {
+        id: String,
+        result: ResponseResult,
+    },
+    /// `id` is empty when the server omitted it.
+    Error {
+        id: String,
+        error: ErrorBody,
+    },
     Event(Event),
 }
 
@@ -190,8 +197,14 @@ impl<'de> Deserialize<'de> for ServerLine {
                 serde_json::from_value(value).map_err(D::Error::custom)
             };
         if let Some(error) = map.remove("error") {
+            // herdr can reject a request before it parsed the id, so error lines may lack one.
+            let id = if map.contains_key("id") {
+                id(&mut map)?
+            } else {
+                String::new()
+            };
             return Ok(ServerLine::Error {
-                id: id(&mut map)?,
+                id,
                 error: serde_json::from_value(error).map_err(D::Error::custom)?,
             });
         }
@@ -333,6 +346,15 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_error_response_without_id() {
+        let line = r#"{"error":{"code":"invalid_request","message":"bad"}}"#;
+        assert!(matches!(
+            parse_line(line).unwrap(),
+            ServerLine::Error { id, .. } if id.is_empty()
+        ));
     }
 
     #[test]

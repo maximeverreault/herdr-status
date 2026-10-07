@@ -32,6 +32,9 @@ pub enum TransportError {
 pub trait Connection: Send {
     async fn write_line(&mut self, line: &str) -> Result<(), TransportError>;
     /// The next line without its trailing newline, or `None` at EOF.
+    ///
+    /// Cancellation-safe: if the future is dropped mid-line, the bytes read so
+    /// far are kept and the next call continues the same line.
     /// Invalid UTF-8 is replaced lossily rather than failing the stream.
     async fn read_line(&mut self) -> Result<Option<String>, TransportError>;
 }
@@ -47,6 +50,8 @@ pub trait Transport: Send + Sync {
 pub struct StreamConnection<R, W> {
     reader: BufReader<R>,
     writer: W,
+    /// Partial line carried across cancelled `read_line` calls.
+    buf: Vec<u8>,
 }
 
 impl<R, W> StreamConnection<R, W>
@@ -58,6 +63,7 @@ where
         Self {
             reader: BufReader::new(reader),
             writer,
+            buf: Vec::new(),
         }
     }
 }
@@ -78,11 +84,11 @@ where
     }
 
     async fn read_line(&mut self) -> Result<Option<String>, TransportError> {
-        let mut buf = Vec::new();
-        let n = self.reader.read_until(b'\n', &mut buf).await?;
-        if n == 0 {
+        self.reader.read_until(b'\n', &mut self.buf).await?;
+        if self.buf.is_empty() {
             return Ok(None);
         }
+        let mut buf = std::mem::take(&mut self.buf);
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
         }
@@ -125,5 +131,18 @@ mod tests {
         c.write_line("a").await.unwrap();
         c.write_line("b\n").await.unwrap();
         assert_eq!(c.writer, b"a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn read_line_is_cancel_safe() {
+        use std::time::Duration;
+        let (client, mut server) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(client);
+        let mut c = StreamConnection::new(r, w);
+        server.write_all(b"hel").await.unwrap();
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), c.read_line()).await;
+        assert!(timed_out.is_err(), "no full line yet");
+        server.write_all(b"lo\n").await.unwrap();
+        assert_eq!(c.read_line().await.unwrap().as_deref(), Some("hello"));
     }
 }

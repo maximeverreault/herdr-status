@@ -69,14 +69,11 @@ async fn api_error_is_returned_as_client_error_api() {
 }
 
 #[tokio::test]
-async fn connection_closed_before_response_is_protocol_error() {
+async fn connection_closed_before_response_is_closed_error() {
     let server = FakeHerdrServer::start().await;
     server.set_responder(|_, _| Reply::CloseSilently);
     let err = client_for(&server).request(Method::Ping).await.unwrap_err();
-    assert!(
-        matches!(&err, ClientError::Protocol(msg) if msg.contains("closed")),
-        "{err:?}"
-    );
+    assert!(matches!(&err, ClientError::Closed(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -200,4 +197,96 @@ async fn malformed_event_line_is_skipped_not_fatal() {
         stream.next().await.unwrap().unwrap(),
         Event::PaneClosed { .. }
     ));
+}
+
+#[tokio::test]
+async fn error_line_without_id_is_api_error() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| {
+        Reply::RawLine(r#"{"error":{"code":"invalid_request","message":"bad"}}"#.into())
+    });
+    let err = client_for(&server).request(Method::Ping).await.unwrap_err();
+    assert_eq!(err.api_code(), Some("invalid_request"));
+}
+
+#[tokio::test]
+async fn events_lost_without_id_surfaces_from_next() {
+    let server = FakeHerdrServer::start().await;
+    let mut stream = client_for(&server)
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap();
+    server.wait_for_subscribers(1).await;
+    server.push_line(r#"{"error":{"code":"events_lost","message":"subscriber fell behind"}}"#);
+    let err = stream.next().await.unwrap_err();
+    assert_eq!(err.api_code(), Some("events_lost"));
+}
+
+#[tokio::test]
+async fn subscription_ack_with_wrong_id_is_protocol_error() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| {
+        Reply::RawLine(r#"{"id":"other","result":{"type":"subscription_started"}}"#.into())
+    });
+    let err = client_for(&server)
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, ClientError::Protocol(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn stray_response_on_stream_is_skipped() {
+    let server = FakeHerdrServer::start().await;
+    let mut stream = client_for(&server)
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap();
+    server.wait_for_subscribers(1).await;
+    server.push_line(r#"{"id":"x","result":{"type":"ok"}}"#);
+    server.push_json(serde_json::json!({"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p2","workspace_id":"w1"}}));
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        Event::PaneClosed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn subscribe_on_missing_socket_is_not_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::new(Arc::new(UnixSocketTransport::new(
+        dir.path().join("none.sock"),
+    )));
+    let err = client
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ClientError::Transport(herdr_client::transport::TransportError::NotRunning(_))
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_closed_silently_is_closed_error() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| Reply::CloseSilently);
+    let err = client_for(&server)
+        .subscribe(vec![Subscription::lifecycle("pane.closed")])
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, ClientError::Closed(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn snapshot_with_wrong_result_type_is_protocol_error() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| {
+        Reply::Result(serde_json::json!({"type":"pong","version":"0.9.3","protocol":22}))
+    });
+    let err = client_for(&server).snapshot().await.unwrap_err();
+    assert!(matches!(&err, ClientError::Protocol(_)), "{err:?}");
 }

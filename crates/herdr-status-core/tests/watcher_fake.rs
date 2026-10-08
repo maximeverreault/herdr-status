@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use herdr_client::test_support::{fixture_snapshot_result, FakeHerdrServer, Reply};
 use herdr_client::transport::unix::UnixSocketTransport;
@@ -212,11 +213,17 @@ async fn reconcile_timer_takes_periodic_snapshots() {
     cfg.reconcile = Duration::from_millis(100);
     let (handle, mut rx) = start(&server, cfg);
     next_matching(&mut rx, |s| s.is_online()).await;
-    tokio::time::sleep(Duration::from_millis(450)).await;
-    let snapshots = methods(&server)
-        .iter()
-        .filter(|m| *m == "session.snapshot")
-        .count();
+    let count = || {
+        methods(&server)
+            .iter()
+            .filter(|m| *m == "session.snapshot")
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while count() < 5 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let snapshots = count();
     assert!(
         snapshots >= 5,
         "expected initial 2 plus at least 3 reconciles, got {snapshots}"
@@ -315,7 +322,11 @@ async fn eof_rebuilds_without_going_offline() {
 #[tokio::test]
 async fn pane_churn_does_not_trip_the_rebuild_cap() {
     let server = FakeHerdrServer::start().await;
-    let (handle, mut rx) = start(&server, test_cfg());
+    // Long enough that no stable-session reset can mask a counted pane rebuild.
+    let mut cfg = test_cfg();
+    cfg.backoff_min = Duration::from_secs(10);
+    cfg.stable_after = Duration::from_secs(10);
+    let (handle, mut rx) = start(&server, cfg);
     next_matching(&mut rx, |s| s.is_online()).await;
     server.wait_for_subscribers(1).await;
     // Every snapshot alternates between including and omitting w2:p2.
@@ -344,5 +355,151 @@ async fn pane_churn_does_not_trip_the_rebuild_cap() {
     server.close_subscriptions();
     wait_for_subscribe_count(&server, 9).await;
     assert_stays_online(&mut rx, Duration::from_millis(300)).await;
+    handle.shutdown().await;
+}
+
+fn offline_reason(s: &ServerState) -> Option<&str> {
+    match &s.connection {
+        ConnectionState::Offline { reason, .. } => Some(reason),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn request_timeout_fires_and_reports_offline() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|method, _| match method {
+        "session.snapshot" => Reply::Hang,
+        _ => Reply::Result(serde_json::json!({"type":"subscription_started"})),
+    });
+    let mut cfg = test_cfg();
+    cfg.request_timeout = Duration::from_millis(100);
+    let (handle, mut rx) = start(&server, cfg);
+    let off = next_matching(&mut rx, |s| offline_reason(s).is_some()).await;
+    assert_eq!(offline_reason(&off), Some("herdr did not answer in time"));
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_prompt_while_a_snapshot_hangs() {
+    let server = FakeHerdrServer::start().await;
+    let (handle, mut rx) = start(&server, test_cfg());
+    next_matching(&mut rx, |s| s.is_online()).await;
+    server.set_responder(|_, _| Reply::Hang);
+    handle.reconnect();
+    // Let the reconnect reach the hanging first snapshot.
+    let before = server.requests().len();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.requests().len() == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconnect sent a request");
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("shutdown within 1s while a snapshot hangs");
+}
+
+#[tokio::test]
+async fn shutdown_during_backoff_sleep_is_prompt() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| Reply::CloseSilently);
+    let mut cfg = test_cfg();
+    cfg.backoff_min = Duration::from_secs(30);
+    cfg.backoff_max = Duration::from_secs(60);
+    let (handle, mut rx) = start(&server, cfg);
+    next_matching(&mut rx, |s| offline_reason(s).is_some()).await;
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("shutdown within 1s during the backoff sleep");
+}
+
+#[tokio::test]
+async fn rejected_subscribe_rebuilds_then_recovers() {
+    let server = FakeHerdrServer::start().await;
+    let subscribes = Arc::new(AtomicUsize::new(0));
+    let counter = subscribes.clone();
+    server.set_responder(move |method, _| match method {
+        "session.snapshot" => Reply::Result(fixture_snapshot_result()),
+        "events.subscribe" if counter.fetch_add(1, Ordering::SeqCst) == 0 => Reply::Error {
+            code: "invalid_request".into(),
+            message: "unknown pane w1:p1".into(),
+        },
+        "events.subscribe" => Reply::Result(serde_json::json!({"type":"subscription_started"})),
+        other => Reply::Error {
+            code: "invalid_request".into(),
+            message: format!("unexpected {other}"),
+        },
+    });
+    let (handle, mut rx) = start(&server, test_cfg());
+    let online = next_matching(&mut rx, |s| {
+        assert!(
+            offline_reason(s).is_none(),
+            "went offline: {:?}",
+            s.connection
+        );
+        s.is_online()
+    })
+    .await;
+    assert_eq!(online.rows.len(), 2);
+    assert_eq!(subscribes.load(Ordering::SeqCst), 2);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn streak_cap_trips_to_offline() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|method, _| match method {
+        "session.snapshot" => Reply::Result(fixture_snapshot_result()),
+        _ => Reply::CloseSilently,
+    });
+    let (handle, mut rx) = start(&server, test_cfg());
+    let off = next_matching(&mut rx, |s| offline_reason(s).is_some()).await;
+    assert_eq!(
+        offline_reason(&off),
+        Some("connection closed before subscription ack")
+    );
+    let subscribes = methods(&server)
+        .iter()
+        .filter(|m| *m == "events.subscribe")
+        .count();
+    assert_eq!(
+        subscribes, 6,
+        "five rebuilds allowed, the sixth closed subscribe fails"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn backoff_resets_after_stable_session_ends_in_eof() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|_, _| Reply::CloseSilently);
+    let mut cfg = test_cfg();
+    cfg.backoff_min = Duration::from_millis(50);
+    cfg.backoff_max = Duration::from_secs(2);
+    cfg.stable_after = Duration::from_millis(100);
+    let (handle, mut rx) = start(&server, cfg);
+    // Four failures: waits of 50, 100, 200 and 400 ms; the next would be 800 ms.
+    for _ in 0..4 {
+        next_matching(&mut rx, |s| offline_reason(s).is_some()).await;
+    }
+    server.reset_responder();
+    next_matching(&mut rx, |s| s.is_online()).await;
+    server.wait_for_subscribers(1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    server.set_responder(|_, _| Reply::CloseSilently);
+    server.close_subscriptions();
+    let off = next_matching(&mut rx, |s| offline_reason(s).is_some()).await;
+    let ConnectionState::Offline { retry_at, .. } = off.connection else {
+        unreachable!()
+    };
+    let wait = retry_at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    assert!(
+        wait <= Duration::from_millis(150),
+        "expected about backoff_min, got {wait:?}"
+    );
     handle.shutdown().await;
 }

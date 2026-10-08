@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +13,9 @@ use herdr_client::transport::{Connection, Transport, TransportError};
 
 use crate::config::RemoteConfig;
 use crate::launchers::{self, SshOptions};
-use crate::remote_connect::{bridge_transport_for, ProcessRunner, RemoteCache, RemoteResolver};
+use crate::remote_connect::{
+    bridge_transport_for, ProcessRunner, RemoteCache, RemoteCacheEntry, RemoteResolver,
+};
 use crate::remote_probe::parse_discovery_output;
 
 const FIRST_CONTACT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,7 +39,10 @@ impl TransportSource for FixedSource {
 }
 
 /// Tries `primary`; on `NotRunning` tries `fallback` once and, if that works,
-/// sticks with it. Used on Windows for named pipe → local `herdr.exe` bridge.
+/// sticks with it. If the sticky fallback later fails, the choice is dropped
+/// and `primary` is tried once more in the same call, so a herdr that is simply
+/// not running reports `NotRunning` again rather than the fallback's error.
+/// Used on Windows for named pipe → local `herdr.exe` bridge.
 pub struct FallbackTransport {
     primary: Arc<dyn Transport>,
     fallback: Arc<dyn Transport>,
@@ -58,7 +63,14 @@ impl FallbackTransport {
 impl Transport for FallbackTransport {
     async fn connect(&self) -> Result<Box<dyn Connection>, TransportError> {
         if self.use_fallback.load(Ordering::SeqCst) {
-            return self.fallback.connect().await;
+            match self.fallback.connect().await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    tracing::info!(error = %e, primary = %self.primary.describe(), "fallback transport failed; trying primary again");
+                    self.use_fallback.store(false, Ordering::SeqCst);
+                    return self.primary.connect().await;
+                }
+            }
         }
         match self.primary.connect().await {
             Ok(conn) => Ok(conn),
@@ -111,7 +123,11 @@ impl WslSource {
 #[async_trait]
 impl TransportSource for WslSource {
     async fn transport(&self) -> Result<Arc<dyn Transport>, String> {
-        let cached = self.herdr_path.lock().unwrap().clone();
+        let cached = self
+            .herdr_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let path = match cached {
             Some(p) => p,
             None => {
@@ -136,7 +152,10 @@ impl TransportSource for WslSource {
                             msg.lines().last().unwrap_or(msg).to_string()
                         }
                     })?;
-                *self.herdr_path.lock().unwrap() = Some(path.clone());
+                *self
+                    .herdr_path
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
                 path
             }
         };
@@ -148,7 +167,10 @@ impl TransportSource for WslSource {
     }
 
     fn invalidate(&self) {
-        *self.herdr_path.lock().unwrap() = None;
+        *self
+            .herdr_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -159,6 +181,8 @@ pub struct RemoteSource {
     ssh: SshOptions,
     cache: Arc<Mutex<RemoteCache>>,
     cache_path: PathBuf,
+    /// Serialises first contact so concurrent callers do not resolve twice.
+    resolve_lock: tokio::sync::Mutex<()>,
 }
 
 impl RemoteSource {
@@ -175,11 +199,25 @@ impl RemoteSource {
             ssh,
             cache,
             cache_path,
+            resolve_lock: tokio::sync::Mutex::new(()),
         }
     }
 
+    fn cached_entry(&self) -> Option<RemoteCacheEntry> {
+        self.cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&self.cfg.ssh_target)
+            .cloned()
+    }
+
     fn save_cache(&self) {
-        if let Err(e) = self.cache.lock().unwrap().save(&self.cache_path) {
+        if let Err(e) = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .save(&self.cache_path)
+        {
             tracing::warn!(error = %e, "could not save remote cache");
         }
     }
@@ -188,38 +226,46 @@ impl RemoteSource {
 #[async_trait]
 impl TransportSource for RemoteSource {
     async fn transport(&self) -> Result<Arc<dyn Transport>, String> {
-        let cached = self
-            .cache
-            .lock()
-            .unwrap()
-            .get(&self.cfg.ssh_target)
-            .cloned();
-        let entry = match cached {
+        let entry = match self.cached_entry() {
             Some(entry) => entry,
             None => {
-                let resolver = RemoteResolver {
-                    runner: self.runner.as_ref(),
-                    ssh: self.ssh.clone(),
-                    timeout: FIRST_CONTACT_TIMEOUT,
-                };
-                let entry = resolver
-                    .resolve(&self.cfg)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .insert(&self.cfg.ssh_target, entry.clone());
-                self.save_cache();
-                entry
+                let _resolving = self.resolve_lock.lock().await;
+                // Another caller may have finished first contact while we waited.
+                match self.cached_entry() {
+                    Some(entry) => entry,
+                    None => {
+                        let resolver = RemoteResolver {
+                            runner: self.runner.as_ref(),
+                            ssh: self.ssh.clone(),
+                            timeout: FIRST_CONTACT_TIMEOUT,
+                        };
+                        let entry = resolver
+                            .resolve(&self.cfg)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        self.cache
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(&self.cfg.ssh_target, entry.clone());
+                        self.save_cache();
+                        entry
+                    }
+                }
             }
         };
         Ok(Arc::new(bridge_transport_for(&self.cfg, &entry, &self.ssh)))
     }
 
     fn invalidate(&self) {
-        self.cache.lock().unwrap().remove(&self.cfg.ssh_target);
-        self.save_cache();
+        let removed = {
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            let present = cache.get(&self.cfg.ssh_target).is_some();
+            cache.remove(&self.cfg.ssh_target);
+            present
+        };
+        if removed {
+            self.save_cache();
+        }
     }
 }
 
@@ -231,21 +277,28 @@ mod tests {
     use herdr_client::transport::bridge::ChildCommand;
     use herdr_client::transport::{Connection, StreamConnection, TransportError};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
     /// A transport that either fails with NotRunning or hands out a loopback connection.
     struct StubTransport {
-        ok: bool,
+        ok: AtomicBool,
         connects: AtomicUsize,
+    }
+
+    fn stub(ok: bool) -> Arc<StubTransport> {
+        Arc::new(StubTransport {
+            ok: AtomicBool::new(ok),
+            connects: AtomicUsize::new(0),
+        })
     }
 
     #[async_trait]
     impl Transport for StubTransport {
         async fn connect(&self) -> Result<Box<dyn Connection>, TransportError> {
             self.connects.fetch_add(1, Ordering::SeqCst);
-            if self.ok {
+            if self.ok.load(Ordering::SeqCst) {
                 let (a, _b) = tokio::io::duplex(64);
                 let (r, w) = tokio::io::split(a);
                 Ok(Box::new(StreamConnection::new(r, w)))
@@ -254,7 +307,7 @@ mod tests {
             }
         }
         fn describe(&self) -> String {
-            if self.ok {
+            if self.ok.load(Ordering::SeqCst) {
                 "stub ok".into()
             } else {
                 "stub down".into()
@@ -285,6 +338,8 @@ mod tests {
             _timeout: Duration,
         ) -> std::io::Result<RunOutput> {
             self.calls.lock().unwrap().push(command.clone());
+            // Yield so concurrent callers interleave as with a real child process.
+            tokio::task::yield_now().await;
             Ok(self
                 .outputs
                 .lock()
@@ -307,24 +362,15 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_source_returns_the_same_transport() {
-        let t: Arc<dyn Transport> = Arc::new(StubTransport {
-            ok: true,
-            connects: AtomicUsize::new(0),
-        });
+        let t: Arc<dyn Transport> = stub(true);
         let source = FixedSource(t.clone());
         assert_eq!(source.transport().await.unwrap().describe(), "stub ok");
     }
 
     #[tokio::test]
     async fn fallback_transport_switches_when_primary_is_not_running() {
-        let primary = Arc::new(StubTransport {
-            ok: false,
-            connects: AtomicUsize::new(0),
-        });
-        let fallback = Arc::new(StubTransport {
-            ok: true,
-            connects: AtomicUsize::new(0),
-        });
+        let primary = stub(false);
+        let fallback = stub(true);
         let t = FallbackTransport::new(primary.clone(), fallback.clone());
         assert!(t.connect().await.is_ok());
         assert!(t.connect().await.is_ok());
@@ -339,14 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_transport_reports_primary_error_when_both_fail() {
-        let primary = Arc::new(StubTransport {
-            ok: false,
-            connects: AtomicUsize::new(0),
-        });
-        let fallback = Arc::new(StubTransport {
-            ok: false,
-            connects: AtomicUsize::new(0),
-        });
+        let primary = stub(false);
+        let fallback = stub(false);
         let t = FallbackTransport::new(primary, fallback);
         assert!(matches!(
             t.connect().await,
@@ -425,5 +465,74 @@ mod tests {
             source.transport().await.is_err(),
             "re-probe with no scripted output fails"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_transport_retries_primary_when_sticky_fallback_fails() {
+        let primary = stub(false);
+        let fallback = stub(true);
+        let t = FallbackTransport::new(primary.clone(), fallback.clone());
+        assert!(t.connect().await.is_ok());
+        assert_eq!(t.describe(), "stub ok (fallback)");
+        fallback.ok.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            t.connect().await,
+            Err(TransportError::NotRunning(_))
+        ));
+        assert_eq!(
+            primary.connects.load(Ordering::SeqCst),
+            2,
+            "primary retried in the same call"
+        );
+        assert_eq!(t.describe(), "stub down", "no longer sticky");
+        primary.ok.store(true, Ordering::SeqCst);
+        assert!(t.connect().await.is_ok());
+        assert_eq!(
+            fallback.connects.load(Ordering::SeqCst),
+            2,
+            "fallback not retried once primary works"
+        );
+    }
+
+    fn remote_source(runner: Arc<FakeRunner>, cache_path: PathBuf) -> RemoteSource {
+        let cfg = RemoteConfig {
+            label: "box".into(),
+            ssh_target: "box".into(),
+            session: "default".into(),
+            os: None,
+            herdr_path: None,
+        };
+        RemoteSource::new(
+            cfg,
+            runner,
+            SshOptions {
+                client: Platform::Mac,
+                control_dir: None,
+            },
+            Arc::new(Mutex::new(RemoteCache::default())),
+            cache_path,
+        )
+    }
+
+    #[tokio::test]
+    async fn remote_source_concurrent_first_contact_resolves_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(vec![
+            ok("Linux\nx86_64\n"),
+            ok("herdr-status-discovery:/usr/local/bin/herdr\n"),
+        ]);
+        let source = remote_source(runner.clone(), dir.path().join("cache.json"));
+        let (a, b) = tokio::join!(source.transport(), source.transport());
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(runner.calls().len(), 2, "one resolve (uname + discovery)");
+    }
+
+    #[test]
+    fn remote_invalidate_without_entry_does_not_write_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("cache.json");
+        let source = remote_source(FakeRunner::new(vec![]), cache_path.clone());
+        source.invalidate();
+        assert!(!cache_path.exists());
     }
 }

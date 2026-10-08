@@ -152,12 +152,17 @@ async fn reconnect_all_and_client_for() {
     })
     .await
     .expect("resubscribed");
-    let client = hub.client_for("local").await.expect("client for local");
+    let client = hub.client_for("local").await.unwrap();
     assert!(matches!(
         client.request(Method::Ping).await.unwrap(),
         ResponseResult::Pong { .. }
     ));
-    assert!(hub.client_for("nope").await.is_none());
+    assert_eq!(
+        hub.client_for("nope").await.err().unwrap().code,
+        "unknown_server"
+    );
+    assert!(hub.source_for("local").is_some());
+    assert!(hub.source_for("nope").is_none());
     hub.shutdown().await;
 }
 
@@ -183,4 +188,62 @@ fn specs_follow_platform_and_enabled_flag() {
     assert_eq!(win, vec!["local", "u", "box"]);
     let off = Config::parse("[local]\nenabled = false\n").unwrap();
     assert!(specs_from_config(&off, Platform::Mac).is_empty());
+}
+
+#[tokio::test]
+async fn changed_spec_restarts_the_watcher() {
+    let local = Arc::new(FakeHerdrServer::start().await);
+    let remote = Arc::new(FakeHerdrServer::start().await);
+    let mut hub = Hub::new(
+        factory(HashMap::from([
+            ("local".to_string(), local.clone()),
+            ("box".to_string(), remote.clone()),
+        ])),
+        fast(),
+    );
+    let mut rx = hub.subscribe();
+    let cfg = |session: &str| {
+        Config::parse(&format!(
+            "[[remote]]\nlabel = \"box\"\nssh_target = \"box\"\nsession = \"{session}\"\n"
+        ))
+        .unwrap()
+    };
+    hub.apply_config(&cfg("default"), Platform::Mac).await;
+    wait_list(&mut rx, |l| l.rows.len() == 4).await;
+    let subs = |s: &FakeHerdrServer| {
+        s.requests()
+            .iter()
+            .filter(|r| r["method"] == "events.subscribe")
+            .count()
+    };
+    let before = subs(&remote);
+    hub.apply_config(&cfg("agents"), Platform::Mac).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while subs(&remote) <= before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new watcher subscribed");
+    let list = wait_list(&mut rx, |l| l.rows.len() == 4).await;
+    assert_eq!(list.servers.len(), 2);
+    assert_eq!(list.rows.iter().filter(|r| r.server_id == "box").count(), 2);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn removing_a_server_in_backoff_is_prompt() {
+    let mut hub = Hub::new(factory(HashMap::new()), fast());
+    let with = Config::parse("[[remote]]\nlabel = \"ghost\"\nssh_target = \"ghost\"\n").unwrap();
+    hub.apply_config(&with, Platform::Mac).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let started = std::time::Instant::now();
+    hub.apply_config(
+        &Config::parse("[local]\nenabled = false\n").unwrap(),
+        Platform::Mac,
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(hub.current().servers.is_empty());
+    hub.shutdown().await;
 }

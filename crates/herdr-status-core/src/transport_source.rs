@@ -183,6 +183,8 @@ pub struct RemoteSource {
     cache_path: PathBuf,
     /// Serialises first contact so concurrent callers do not resolve twice.
     resolve_lock: tokio::sync::Mutex<()>,
+    /// So a persistently unusable control dir logs once, not on every reconnect.
+    control_dir_warned: AtomicBool,
 }
 
 impl RemoteSource {
@@ -200,7 +202,21 @@ impl RemoteSource {
             cache,
             cache_path,
             resolve_lock: tokio::sync::Mutex::new(()),
+            control_dir_warned: AtomicBool::new(false),
         }
+    }
+
+    /// The configured SSH options with `control_dir` validated (and re-created if
+    /// macOS cleaned `/tmp` since the last connection) or dropped.
+    fn effective_ssh(&self) -> SshOptions {
+        let mut ssh = self.ssh.clone();
+        if let Some(dir) = ssh.control_dir.take() {
+            ssh.control_dir = crate::paths::ensure_control_dir(&dir);
+            if ssh.control_dir.is_none() && !self.control_dir_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(target = %self.cfg.ssh_target, "ssh connection sharing disabled for this remote");
+            }
+        }
+        ssh
     }
 
     fn cached_entry(&self) -> Option<RemoteCacheEntry> {
@@ -226,6 +242,7 @@ impl RemoteSource {
 #[async_trait]
 impl TransportSource for RemoteSource {
     async fn transport(&self) -> Result<Arc<dyn Transport>, String> {
+        let ssh = self.effective_ssh();
         let entry = match self.cached_entry() {
             Some(entry) => entry,
             None => {
@@ -236,7 +253,7 @@ impl TransportSource for RemoteSource {
                     None => {
                         let resolver = RemoteResolver {
                             runner: self.runner.as_ref(),
-                            ssh: self.ssh.clone(),
+                            ssh: ssh.clone(),
                             timeout: FIRST_CONTACT_TIMEOUT,
                         };
                         let entry = resolver
@@ -253,7 +270,7 @@ impl TransportSource for RemoteSource {
                 }
             }
         };
-        Ok(Arc::new(bridge_transport_for(&self.cfg, &entry, &self.ssh)))
+        Ok(Arc::new(bridge_transport_for(&self.cfg, &entry, &ssh)))
     }
 
     fn invalidate(&self) {

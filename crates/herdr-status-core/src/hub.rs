@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use herdr_client::transport::bridge::BridgeTransport;
 use herdr_client::{Client, Transport};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::actions::ActionError;
 use crate::config::{Config, LocalConfig, RemoteConfig, WslConfig, LOCAL_SERVER_ID};
 use crate::launchers::{self, SshOptions};
 use crate::model::{assemble, AgentList, ServerKind, ServerState};
@@ -63,6 +64,8 @@ pub type SourceFactory = Arc<dyn Fn(&ServerSpec) -> Arc<dyn TransportSource> + S
 
 /// The production factory: Unix socket or named pipe (with `herdr.exe`
 /// fallback) locally, `wsl.exe` for WSL, SSH bridge for remotes.
+///
+/// The Windows fallback runs `herdr.exe` from `PATH`.
 pub fn default_source_factory(
     env: Env,
     platform: Platform,
@@ -90,12 +93,11 @@ pub fn default_source_factory(
                 runner.clone(),
             )),
             ServerSpec::Remote(remote) => {
-                // Re-created at every watcher start: macOS periodically cleans /tmp.
-                let control_dir =
-                    paths::ssh_control_dir(&env, platform).and_then(|dir| secure_control_dir(&dir));
+                // Validated (and re-created if /tmp was cleaned) by the source
+                // on every connection, not here.
                 let ssh = SshOptions {
                     client: platform,
-                    control_dir,
+                    control_dir: paths::ssh_control_dir(&env, platform),
                 };
                 Arc::new(RemoteSource::new(
                     remote.clone(),
@@ -107,49 +109,6 @@ pub fn default_source_factory(
             }
         }
     })
-}
-
-/// Create `dir` (mode 0700) and return it only if it is a private directory we
-/// own. The directory lives in world-writable /tmp, so a pre-existing one could
-/// belong to someone else. Ownership check: we create a marker file inside (this
-/// only succeeds if the directory is writable by us) and compare its uid, which
-/// is our effective uid, with the directory's uid; the mode must be exactly 0700.
-#[cfg(unix)]
-fn secure_control_dir(dir: &std::path::Path) -> Option<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let check = || -> std::io::Result<bool> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let dir_meta = std::fs::symlink_metadata(dir)?;
-        let marker = dir.join(format!(".owner-check-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)?;
-        let marker_meta = std::fs::symlink_metadata(&marker);
-        let _ = std::fs::remove_file(&marker);
-        let my_uid = marker_meta?.uid();
-        Ok(dir_meta.is_dir() && dir_meta.uid() == my_uid && dir_meta.mode() & 0o777 == 0o700)
-    };
-    match check() {
-        Ok(true) => Some(dir.to_path_buf()),
-        Ok(false) => {
-            tracing::warn!(dir = %dir.display(), "ssh control dir is not a private directory we own; connection sharing disabled");
-            None
-        }
-        Err(error) => {
-            tracing::warn!(dir = %dir.display(), %error, "cannot prepare ssh control dir; connection sharing disabled");
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn secure_control_dir(_dir: &std::path::Path) -> Option<PathBuf> {
-    None
 }
 
 fn local_transport(
@@ -192,32 +151,54 @@ struct Running {
     spec: ServerSpec,
     source: Arc<dyn TransportSource>,
     handle: WatcherHandle,
+    /// Tags the watcher's updates with its generation; aborted before the
+    /// server's state is removed so nothing stale can land afterwards.
+    forwarder: JoinHandle<()>,
+}
+
+/// Latest state per server id, with the generation of the watcher that owns it.
+type States = Mutex<HashMap<String, (u64, ServerState)>>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub struct Hub {
     factory: SourceFactory,
     watcher_cfg: WatcherConfig,
     running: HashMap<String, Running>,
+    next_generation: u64,
     order: Arc<Mutex<Vec<String>>>,
-    states: Arc<Mutex<HashMap<String, ServerState>>>,
+    states: Arc<States>,
     list_tx: watch::Sender<AgentList>,
-    updates_tx: mpsc::Sender<ServerState>,
+    updates_tx: mpsc::Sender<(String, u64, ServerState)>,
     merge_task: JoinHandle<()>,
 }
 
 impl Hub {
+    /// Spawns the merge task, so it must be called inside a tokio runtime.
+    ///
+    /// # Panics
+    /// Panics outside a tokio runtime. The Tauri app must create the hub inside
+    /// `tauri::async_runtime`.
     pub fn new(factory: SourceFactory, watcher_cfg: WatcherConfig) -> Self {
         let (list_tx, _) = watch::channel(AgentList::default());
-        let (updates_tx, mut updates_rx) = mpsc::channel::<ServerState>(256);
+        let (updates_tx, mut updates_rx) = mpsc::channel::<(String, u64, ServerState)>(256);
         let order = Arc::new(Mutex::new(Vec::new()));
-        let states = Arc::new(Mutex::new(HashMap::new()));
+        let states: Arc<States> = Arc::new(Mutex::new(HashMap::new()));
         let merge_task = {
             let order = order.clone();
             let states = states.clone();
             let list_tx = list_tx.clone();
             tokio::spawn(async move {
-                while let Some(state) = updates_rx.recv().await {
-                    states.lock().unwrap().insert(state.id.clone(), state);
+                while let Some((id, generation, state)) = updates_rx.recv().await {
+                    {
+                        let mut states = lock(&states);
+                        match states.get_mut(&id) {
+                            Some(slot) if slot.0 == generation => slot.1 = state,
+                            _ => continue, // from a watcher that was stopped or replaced
+                        }
+                    }
                     publish(&order, &states, &list_tx);
                 }
             })
@@ -226,6 +207,7 @@ impl Hub {
             factory,
             watcher_cfg,
             running: HashMap::new(),
+            next_generation: 0,
             order,
             states,
             list_tx,
@@ -243,6 +225,9 @@ impl Hub {
     }
 
     /// Start new servers, stop removed or changed ones, keep the rest running.
+    ///
+    /// Changing only `ui.reconcile_seconds` does not restart running watchers; it
+    /// applies to watchers started afterwards.
     pub async fn apply_config(&mut self, cfg: &Config, platform: Platform) {
         let specs = specs_from_config(cfg, platform);
         let wanted: HashMap<&str, &ServerSpec> = specs.iter().map(|s| (s.id(), s)).collect();
@@ -258,36 +243,55 @@ impl Hub {
             .filter(|(id, r)| wanted.get(id.as_str()).is_none_or(|spec| **spec != r.spec))
             .map(|(id, _)| id.clone())
             .collect();
+        let mut stopping = Vec::new();
         for id in stale {
             if let Some(r) = self.running.remove(&id) {
-                r.handle.shutdown().await;
+                // Cut the update path first, then drop the state.
+                r.forwarder.abort();
+                lock(&self.states).remove(&id);
+                stopping.push(r.handle);
             }
-            self.states.lock().unwrap().remove(&id);
         }
+        shutdown_all(stopping).await;
+
+        *lock(&self.order) = specs.iter().map(|s| s.id().to_string()).collect();
 
         for spec in &specs {
             if self.running.contains_key(spec.id()) {
                 continue;
             }
+            self.next_generation += 1;
+            let generation = self.next_generation;
             let source = (self.factory)(spec);
             let state = ServerState::new(spec.id(), spec.id(), spec.kind());
-            let handle = spawn_watcher(
-                state,
-                source.clone(),
-                watcher_cfg.clone(),
-                self.updates_tx.clone(),
-            );
+            lock(&self.states).insert(spec.id().to_string(), (generation, state.clone()));
+
+            let (tx, mut rx) = mpsc::channel::<ServerState>(16);
+            let merge_tx = self.updates_tx.clone();
+            let id = spec.id().to_string();
+            let forwarder = tokio::spawn(async move {
+                while let Some(state) = rx.recv().await {
+                    if merge_tx
+                        .send((id.clone(), generation, state))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let handle = spawn_watcher(state, source.clone(), watcher_cfg.clone(), tx);
             self.running.insert(
                 spec.id().to_string(),
                 Running {
                     spec: spec.clone(),
                     source,
                     handle,
+                    forwarder,
                 },
             );
         }
 
-        *self.order.lock().unwrap() = specs.iter().map(|s| s.id().to_string()).collect();
         publish(&self.order, &self.states, &self.list_tx);
     }
 
@@ -297,36 +301,54 @@ impl Hub {
         }
     }
 
-    /// A one-shot client for quick actions, or `None` for an unknown server.
-    pub async fn client_for(&self, server_id: &str) -> Option<Client> {
-        let source = self.running.get(server_id)?.source.clone();
+    /// The transport source of a running server, or `None` for an unknown id.
+    /// Synchronous and cheap (clones an `Arc`), so the app can look it up under a
+    /// lock and then run `transport()` and the action outside that lock.
+    pub fn source_for(&self, server_id: &str) -> Option<Arc<dyn TransportSource>> {
+        self.running.get(server_id).map(|r| r.source.clone())
+    }
+
+    /// A one-shot client for quick actions. The app should prefer [`Hub::source_for`]
+    /// and call `transport()` plus the action outside any lock around the hub.
+    pub async fn client_for(&self, server_id: &str) -> Result<Client, ActionError> {
+        let source = self
+            .source_for(server_id)
+            .ok_or_else(|| ActionError::unknown_server(server_id))?;
         match source.transport().await {
-            Ok(transport) => Some(Client::new(transport)),
+            Ok(transport) => Ok(Client::new(transport)),
             Err(reason) => {
                 tracing::warn!(server_id, %reason, "no transport for quick action");
-                None
+                Err(ActionError::unreachable(server_id))
             }
         }
     }
 
     pub async fn shutdown(mut self) {
+        let mut stopping = Vec::new();
         for (_, r) in self.running.drain() {
-            r.handle.shutdown().await;
+            r.forwarder.abort();
+            stopping.push(r.handle);
         }
+        shutdown_all(stopping).await;
         self.merge_task.abort();
     }
 }
 
-fn publish(
-    order: &Mutex<Vec<String>>,
-    states: &Mutex<HashMap<String, ServerState>>,
-    list_tx: &watch::Sender<AgentList>,
-) {
-    let order = order.lock().unwrap();
-    let states = states.lock().unwrap();
+/// Stop watchers concurrently so one slow shutdown does not delay the rest.
+async fn shutdown_all(handles: Vec<WatcherHandle>) {
+    let mut set = tokio::task::JoinSet::new();
+    for handle in handles {
+        set.spawn(handle.shutdown());
+    }
+    while set.join_next().await.is_some() {}
+}
+
+fn publish(order: &Mutex<Vec<String>>, states: &States, list_tx: &watch::Sender<AgentList>) {
+    let order = lock(order);
+    let states = lock(states);
     let ordered: Vec<ServerState> = order
         .iter()
-        .filter_map(|id| states.get(id).cloned())
+        .filter_map(|id| states.get(id).map(|(_, s)| s.clone()))
         .collect();
     let _ = list_tx.send(assemble(&ordered));
 }

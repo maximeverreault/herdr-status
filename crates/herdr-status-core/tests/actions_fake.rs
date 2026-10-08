@@ -99,3 +99,14 @@ async fn transport_failure_names_the_server() {
     assert_eq!(err.code, "transport");
     assert_eq!(err.message, "Could not reach winbox.");
 }
+
+#[tokio::test]
+async fn overlong_message_is_rejected_before_calling() {
+    let server = FakeHerdrServer::start().await;
+    let c = client(&server).await;
+    let err = send_message(&c, "w2:p1", &"x".repeat(16 * 1024 + 1), "local")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "message_too_long");
+    assert!(server.requests().is_empty());
+}

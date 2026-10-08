@@ -135,6 +135,11 @@ impl FakeHerdrServer {
         *self.inner.responder.lock().unwrap() = Arc::new(f);
     }
 
+    /// Restore the built-in responder.
+    pub fn reset_responder(&self) {
+        *self.inner.responder.lock().unwrap() = default_responder();
+    }
+
     /// Every request received so far, as parsed JSON, in order.
     pub fn requests(&self) -> Vec<Value> {
         self.inner.requests.lock().unwrap().clone()

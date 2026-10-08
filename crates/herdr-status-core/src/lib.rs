@@ -8,3 +8,4 @@ pub mod reducer;
 pub mod remote_connect;
 pub mod remote_probe;
 pub mod transport_source;
+pub mod watcher;

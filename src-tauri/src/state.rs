@@ -11,8 +11,6 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub struct AppState {
-    // read by the tray/config-watch tasks (Plan 3 Tasks 4-5)
-    #[allow(dead_code)]
     pub platform: Platform,
     // read by the tray/config-watch tasks (Plan 3 Tasks 4-5)
     #[allow(dead_code)]
@@ -22,14 +20,13 @@ pub struct AppState {
     #[allow(dead_code)]
     pub data_dir: PathBuf,
     pub log_dir: PathBuf,
-    pub hub: tokio::sync::Mutex<Hub>,
+    /// `None` once the app is shutting down (taken by the exit handler).
+    pub hub: tokio::sync::Mutex<Option<Hub>>,
     pub config: Mutex<Config>,
     pub latest: Mutex<AgentList>,
     /// Banner text when `config.toml` is invalid; read by the UI at start.
     pub config_error: Mutex<Option<String>>,
     /// Keeps the config file watcher alive for the life of the app.
-    // read by the tray/config-watch tasks (Plan 3 Tasks 4-5)
-    #[allow(dead_code)]
     pub config_watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 

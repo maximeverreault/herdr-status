@@ -35,7 +35,10 @@ async fn client_for(
     deadline: Instant,
 ) -> Result<(Client, String), ActionError> {
     let source: Arc<dyn TransportSource> = {
-        let hub = state.hub.lock().await;
+        let guard = state.hub.lock().await;
+        let hub = guard
+            .as_ref()
+            .ok_or_else(|| ActionError::new("shutting_down", "herdr-status is shutting down."))?;
         hub.source_for(server)
     }
     .ok_or_else(|| ActionError::unknown_server(server))?;
@@ -137,7 +140,9 @@ pub fn get_config_error(state: State<'_, Arc<AppState>>) -> Option<String> {
 
 #[tauri::command]
 pub async fn reconnect_all(state: State<'_, Arc<AppState>>) -> Result<(), ()> {
-    state.hub.lock().await.reconnect_all();
+    if let Some(hub) = state.hub.lock().await.as_ref() {
+        hub.reconnect_all();
+    }
     Ok(())
 }
 

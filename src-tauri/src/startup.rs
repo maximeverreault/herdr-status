@@ -74,7 +74,7 @@ pub async fn boot(
         config_path,
         data_dir,
         log_dir,
-        hub: tokio::sync::Mutex::new(hub),
+        hub: tokio::sync::Mutex::new(Some(hub)),
         config: Mutex::new(config),
         latest: Mutex::new(Default::default()),
         config_error: Mutex::new(config_error),

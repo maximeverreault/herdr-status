@@ -4,6 +4,7 @@
 //! down (bridge children are `kill_on_drop`).
 
 mod commands;
+mod config_watch;
 mod startup;
 mod state;
 // `pub` only to avoid dead-code warnings until Task 5 wires the tray.
@@ -62,6 +63,9 @@ pub fn run() {
             let state =
                 tauri::async_runtime::block_on(startup::boot(&handle, env, platform, log_dir))?;
             app.manage(state);
+            if let Err(e) = config_watch::start(&handle) {
+                log::warn!("config watcher not started: {e}");
+            }
             let window = app.get_webview_window("main").expect("main window exists");
             if std::env::args().any(|a| a == "--hidden") {
                 let _ = window.hide();

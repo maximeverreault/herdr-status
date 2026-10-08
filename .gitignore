@@ -9,6 +9,5 @@ ui/dist/
 # OS
 .DS_Store
 
-src-tauri/target/
 src-tauri/gen/schemas/
 ui/node_modules/

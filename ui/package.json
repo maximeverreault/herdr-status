@@ -6,8 +6,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "tsc --noEmit && vitest run",
-    "tauri": "tauri",
-    "icon": "bun run scripts/make-app-icon.ts && tauri icon ../src-tauri/icons/source.png -o ../src-tauri/icons"
+    "tauri": "cd .. && ui/node_modules/.bin/tauri",
+    "icon": "bun run scripts/make-app-icon.ts && cd .. && ui/node_modules/.bin/tauri icon src-tauri/icons/source.png -o src-tauri/icons"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.6.0"

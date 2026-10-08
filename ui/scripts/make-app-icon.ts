@@ -3,8 +3,8 @@ import { writeFileSync, mkdirSync } from "node:fs";
 
 const size = 1024;
 const png = new PNG({ width: size, height: size });
-const bg = [0x0f, 0x11, 0x15];
-const disc = [0xff, 0x9f, 0x0a];
+const bg = [0x0f, 0x11, 0x15] as const;
+const disc = [0xff, 0x9f, 0x0a] as const;
 const radius = size * 0.22;
 const corner = size * 0.2;
 

@@ -11,3 +11,7 @@ ui/dist/
 
 src-tauri/gen/schemas/
 ui/node_modules/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*Logo.png
+src-tauri/icons/StoreLogo.png

@@ -11,6 +11,8 @@ Run with `cd ui && bun tauri dev` (or the bundled `.app`) and herdr running. Fix
 - [ ] Message tab: type `summarize what you did in one line`, press Enter; the agent receives it.
 - [ ] (Optional, stops your session) `herdr server stop`: chip grey, rows vanish, "herdr is not running"; restart herdr: chip green, rows back within 5 s.
 - [ ] Add a bogus `[[remote]]` with `ssh_target = "nohost.invalid"`: within a second a `nohost...` chip appears grey with an offline group reading `Unreachable · retrying ...`; remove it: the chip disappears.
+- [ ] Real POSIX remote: chip green, peek/keys/message work, `ls /tmp/herdr-status-<user>/` shows a control socket, and the master survives app quit for up to 10 minutes.
+- [ ] Windows SSH host remote: connects through the PowerShell bridge; `os` and `herdr_path` detection is cached in `cache.json`.
 - [ ] Resize the window narrow (260 px): names ellipsise, nothing wraps.
 - [ ] Close the window, click the tray: it comes back where it was.
 

@@ -255,11 +255,7 @@ impl Hub {
         let stale: Vec<String> = self
             .running
             .iter()
-            .filter(|(id, r)| {
-                wanted
-                    .get(id.as_str())
-                    .map_or(true, |spec| **spec != r.spec)
-            })
+            .filter(|(id, r)| wanted.get(id.as_str()).is_none_or(|spec| **spec != r.spec))
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {

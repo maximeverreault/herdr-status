@@ -63,16 +63,14 @@ pub async fn boot(
         load_or_create(&config_path, platform, runner.as_ref(), &env).await;
     // Runs under `block_on` in `setup`, which enters Tauri's tokio runtime, so
     // the `tokio::spawn` inside `Hub::new` works.
-    let factory = default_source_factory(env.clone(), platform, runner, data_dir.clone());
+    let factory = default_source_factory(env, platform, runner, data_dir);
     let mut hub = Hub::new(factory, WatcherConfig::default());
     hub.apply_config(&config, platform).await;
     let mut list_rx = hub.subscribe();
 
     let state = Arc::new(AppState {
         platform,
-        env,
         config_path,
-        data_dir,
         log_dir,
         hub: tokio::sync::Mutex::new(Some(hub)),
         config: Mutex::new(config),

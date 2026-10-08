@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use herdr_status_core::{AgentList, Config, Env, Hub, Platform};
+use herdr_status_core::{AgentList, Config, Hub, Platform};
 
 /// Lock a std mutex, ignoring poisoning (the guarded data stays usable).
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -12,13 +12,7 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct AppState {
     pub platform: Platform,
-    // read by the tray/config-watch tasks (Plan 3 Tasks 4-5)
-    #[allow(dead_code)]
-    pub env: Env,
     pub config_path: PathBuf,
-    // read by the tray/config-watch tasks (Plan 3 Tasks 4-5)
-    #[allow(dead_code)]
-    pub data_dir: PathBuf,
     pub log_dir: PathBuf,
     /// `None` once the app is shutting down (taken by the exit handler).
     pub hub: tokio::sync::Mutex<Option<Hub>>,

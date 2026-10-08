@@ -23,3 +23,17 @@ pub fn toggle(app: &AppHandle) {
         show(app);
     }
 }
+
+/// The close button hides the window; the app lives in the tray.
+pub fn install_close_to_hide(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let target = w.clone();
+    w.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = target.hide();
+        }
+    });
+}

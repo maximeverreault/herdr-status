@@ -1,7 +1,8 @@
 //! herdr-status desktop app: Tauri glue around `herdr_status_core`.
 //!
-//! There is no explicit hub shutdown on exit: process exit tears everything
-//! down (bridge children are `kill_on_drop`).
+//! On exit the hub is taken out of the app state and shut down (bounded by a
+//! 2 s timeout). Bridge children are `kill_on_drop`, so even if the timeout
+//! fires, dropping the hub cannot leave bridge processes behind.
 
 mod commands;
 mod config_watch;
@@ -10,6 +11,9 @@ mod state;
 mod tray;
 mod tray_icon;
 mod window;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use herdr_status_core::{paths, Env, Platform};
 use tauri::Manager;
@@ -28,7 +32,12 @@ pub fn run() {
     let env = Env::from_process();
     let platform = Platform::current();
     let log_dir = paths::app_log_dir(&env, platform);
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // Must be first so a second launch never runs `boot`.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!("second instance launched; showing the main window");
+            window::show(app);
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log_level())
@@ -48,6 +57,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_agents,
             commands::peek,
@@ -67,6 +77,7 @@ pub fn run() {
                 log::warn!("config watcher not started: {e}");
             }
             tray::build(&handle)?;
+            window::install_close_to_hide(&handle);
             let window = app.get_webview_window("main").expect("main window exists");
             if std::env::args().any(|a| a == "--hidden") {
                 let _ = window.hide();
@@ -75,6 +86,34 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running herdr-status");
+        .build(tauri::generate_context!())
+        .expect("error while building herdr-status");
+
+    app.run(|app, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => window::show(app),
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => shutdown_hub(app),
+        _ => {}
+    });
+}
+
+/// Stop every watcher and bridge. Idempotent: the hub is taken on first call.
+fn shutdown_hub(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<Arc<state::AppState>>() else {
+        return;
+    };
+    let state = state.inner().clone();
+    // The timeout also covers waiting for the hub lock (a reload may hold it).
+    let result =
+        tauri::async_runtime::block_on(tokio::time::timeout(Duration::from_secs(2), async move {
+            let hub = state.hub.lock().await.take();
+            if let Some(hub) = hub {
+                log::info!("shutting down hub");
+                hub.shutdown().await;
+                log::info!("hub shut down");
+            }
+        }));
+    if result.is_err() {
+        log::warn!("hub shutdown timed out; bridges are killed on drop");
+    }
 }

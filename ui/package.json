@@ -1,0 +1,24 @@
+{
+  "name": "herdr-status-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "tsc --noEmit && vitest run",
+    "tauri": "tauri",
+    "icon": "bun run scripts/make-app-icon.ts && tauri icon ../src-tauri/icons/source.png -o ../src-tauri/icons"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.6.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/pngjs": "^6.0.5",
+    "jsdom": "^26.1.0",
+    "pngjs": "^7.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0",
+    "vitest": "^3.2.0"
+  }
+}

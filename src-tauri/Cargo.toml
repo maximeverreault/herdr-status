@@ -1,0 +1,33 @@
+[package]
+name = "herdr-status-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native status bar for AI agents running in herdr"
+
+[lib]
+name = "herdr_status_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-status"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+herdr-client = { path = "../crates/herdr-client" }
+herdr-status-core = { path = "../crates/herdr-status-core" }
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+log = "0.4"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+notify = "7"

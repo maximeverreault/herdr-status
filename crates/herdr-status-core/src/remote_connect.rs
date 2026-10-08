@@ -99,10 +99,14 @@ impl RemoteCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
         std::fs::write(
-            path,
+            &tmp,
             serde_json::to_string_pretty(self).expect("cache serialises"),
-        )
+        )?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn get(&self, ssh_target: &str) -> Option<&RemoteCacheEntry> {
@@ -126,6 +130,8 @@ pub enum RemoteError {
     HerdrNotFound(String),
     #[error("unsupported remote platform: {0}")]
     UnsupportedPlatform(String),
+    #[error("unexpected output from {0} while locating herdr (check the login shell)")]
+    UnexpectedOutput(String),
     #[error("{0}")]
     Io(String),
 }
@@ -167,7 +173,13 @@ impl<'a> RemoteResolver<'a> {
         self.runner
             .run(&command, self.timeout)
             .await
-            .map_err(|e| RemoteError::Io(e.to_string()))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => RemoteError::Io("ssh not found on PATH".into()),
+                std::io::ErrorKind::TimedOut => {
+                    RemoteError::Ssh(SshFailure::Unreachable, cfg.ssh_target.clone())
+                }
+                _ => RemoteError::Io(e.to_string()),
+            })
     }
 
     async fn detect_platform(&self, cfg: &RemoteConfig) -> Result<RemotePlatform, RemoteError> {
@@ -177,8 +189,13 @@ impl<'a> RemoteResolver<'a> {
                 return Ok(platform);
             }
         }
-        let hint =
-            out.success() && looks_like_windows_uname(out.stdout.lines().next().unwrap_or(""));
+        let first_line = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        let hint = out.success() && looks_like_windows_uname(first_line);
         if should_try_windows_probe(out.success(), out.exit_code, hint) {
             let probe_command =
                 launchers::powershell_encoded_command(&launchers::windows_platform_probe_script());
@@ -188,16 +205,24 @@ impl<'a> RemoteResolver<'a> {
                     return Ok(platform);
                 }
             }
+            if probe.exit_code == Some(255) {
+                return Err(RemoteError::Ssh(
+                    classify_ssh_failure(probe.exit_code, &probe.stderr),
+                    cfg.ssh_target.clone(),
+                ));
+            }
+            return Err(RemoteError::UnsupportedPlatform(format!(
+                "neither uname nor PowerShell responded on {}",
+                cfg.ssh_target
+            )));
         }
-        if !out.success() && (out.exit_code == Some(255) || !out.stderr.trim().is_empty()) {
+        if !out.success() {
             return Err(RemoteError::Ssh(
                 classify_ssh_failure(out.exit_code, &out.stderr),
                 cfg.ssh_target.clone(),
             ));
         }
-        Err(RemoteError::UnsupportedPlatform(
-            out.stdout.trim().to_string(),
-        ))
+        Err(RemoteError::UnsupportedPlatform(first_line.to_string()))
     }
 
     async fn discover(&self, cfg: &RemoteConfig, os: &RemoteOs) -> Result<String, RemoteError> {
@@ -217,6 +242,9 @@ impl<'a> RemoteResolver<'a> {
         }
         if out.exit_code == Some(2) {
             return Err(RemoteError::HerdrNotFound(cfg.ssh_target.clone()));
+        }
+        if out.success() {
+            return Err(RemoteError::UnexpectedOutput(cfg.ssh_target.clone()));
         }
         Err(RemoteError::Ssh(
             classify_ssh_failure(out.exit_code, &out.stderr),
@@ -465,5 +493,70 @@ mod tests {
         );
         assert_eq!(t.describe(), "ssh winbox (windows)");
         assert_eq!(t.command().program, "ssh");
+    }
+
+    #[tokio::test]
+    async fn uname_and_powershell_both_failing_is_unsupported_after_two_calls() {
+        let runner = FakeRunner::new(vec![fail(1, "garbage"), fail(1, "more garbage")]);
+        let err = resolver(&runner).resolve(&cfg("box")).await.unwrap_err();
+        assert!(
+            matches!(err, RemoteError::UnsupportedPlatform(ref m) if m == "neither uname nor PowerShell responded on box"),
+            "{err:?}"
+        );
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn probe_hitting_ssh_failure_is_an_ssh_error() {
+        let runner = FakeRunner::new(vec![
+            fail(1, "x"),
+            fail(255, "Permission denied (publickey)."),
+        ]);
+        let err = resolver(&runner).resolve(&cfg("box")).await.unwrap_err();
+        assert!(
+            matches!(err, RemoteError::Ssh(SshFailure::AuthDenied, _)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_unix_reports_only_first_line() {
+        let runner = FakeRunner::new(vec![ok("SunOS\nsparc\n")]);
+        let err = resolver(&runner).resolve(&cfg("box")).await.unwrap_err();
+        assert!(
+            matches!(err, RemoteError::UnsupportedPlatform(ref m) if m == "SunOS"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_success_without_prefix_is_unexpected_output() {
+        let runner = FakeRunner::new(vec![ok("Linux\nx86_64\n"), ok("/usr/local/bin/herdr\n")]);
+        let err = resolver(&runner).resolve(&cfg("box")).await.unwrap_err();
+        assert!(
+            matches!(err, RemoteError::UnexpectedOutput(ref t) if t == "box"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "unexpected output from box while locating herdr (check the login shell)"
+        );
+    }
+
+    #[test]
+    fn cache_load_tolerates_extra_fields_and_missing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, r#"{"future": 1}"#).unwrap();
+        assert!(RemoteCache::load(&path).entries.is_empty());
+        std::fs::write(
+            &path,
+            r#"{"extra": true, "entries": {"box": {"os": "posix", "arch": "x", "herdr_path": "/h", "checked_at": 1, "new": 2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            RemoteCache::load(&path).get("box").unwrap().herdr_path,
+            "/h"
+        );
     }
 }

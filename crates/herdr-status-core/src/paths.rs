@@ -161,6 +161,31 @@ fn local_appdata(env: &Env) -> PathBuf {
         .join(".local")
         .join("share")
 }
+
+/// Directory for ssh ControlMaster sockets. Short on purpose: a Unix socket
+/// path must fit `sun_path` (104 bytes on macOS). The hub creates it with mode
+/// 0700. Windows OpenSSH has no ControlMaster, so there is none.
+pub fn ssh_control_dir(env: &Env, platform: Platform) -> Option<PathBuf> {
+    match platform {
+        Platform::Windows => None,
+        Platform::Mac => {
+            let user: String = env
+                .get("USER")
+                .unwrap_or("default")
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            Some(PathBuf::from(format!("/tmp/herdr-status-{user}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +309,25 @@ mod tests {
         assert_eq!(
             herdr_socket_path(&w, Platform::Windows, "work").to_string_lossy(),
             r"C:\Users\me\AppData\Roaming\herdr\sessions\work\herdr.sock"
+        );
+    }
+
+    #[test]
+    fn ssh_control_dir_is_short_tmp_path_on_mac_only() {
+        let e = env(&[("USER", "me")]);
+        assert_eq!(
+            ssh_control_dir(&e, Platform::Mac),
+            Some(PathBuf::from("/tmp/herdr-status-me"))
+        );
+        assert_eq!(ssh_control_dir(&e, Platform::Windows), None);
+        let weird = env(&[("USER", "a b/c\"%")]);
+        assert_eq!(
+            ssh_control_dir(&weird, Platform::Mac),
+            Some(PathBuf::from("/tmp/herdr-status-a_b_c__"))
+        );
+        assert_eq!(
+            ssh_control_dir(&env(&[]), Platform::Mac),
+            Some(PathBuf::from("/tmp/herdr-status-default"))
         );
     }
 }

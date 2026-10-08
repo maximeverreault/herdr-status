@@ -3,7 +3,7 @@
 //! command text mirrors herdr 0.9.3's own saved-machine bridge so hosts that
 //! work with `herdr machine add` also work here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use herdr_client::transport::bridge::{ChildCommand, READY_MARKER};
@@ -87,6 +87,7 @@ pub fn posix_sh_command(script: &str) -> String {
 }
 
 /// Finds a herdr binary on a POSIX host that supports the API bridge.
+/// Requires a POSIX-ish remote login shell (tcsh/csh will fail, as with herdr).
 /// Prints the path and exits 0, or exits 2 with a message on stderr.
 pub fn posix_discovery_script(session: &str) -> String {
     let session = quote_posix(session);
@@ -168,22 +169,52 @@ pub struct SshOptions {
     pub control_dir: Option<PathBuf>,
 }
 
+/// Longest ControlPath directory that keeps `<dir>/<%C>` plus ssh's 17-char
+/// temp suffix under the 104-byte `sun_path` limit (`%C` expands to 40 chars).
+const SUN_PATH_LIMIT: usize = 104;
+const CONTROL_PATH_SUFFIX: usize = 1 + 40 + 17;
+
+/// The directory is usable in a `ControlPath` option: no characters ssh would
+/// expand or unquote, and a socket path short enough for `sun_path`.
+fn control_dir_is_usable(dir: &Path) -> bool {
+    let text = dir.to_string_lossy();
+    !text.contains('"')
+        && !text.contains('%')
+        && dir.as_os_str().len() + CONTROL_PATH_SUFFIX < SUN_PATH_LIMIT
+}
+
 /// `ssh` invocation for one remote command. Never prompts (BatchMode).
+///
+/// `-T` and `RemoteCommand=none` stop a user's `~/.ssh/config` (`RequestTTY`,
+/// `RemoteCommand`) from corrupting the bridge stream. `ControlPath` uses `%C`,
+/// which needs OpenSSH 6.7 or newer. `ConnectTimeout=10` sits comfortably
+/// inside the runner's 30 s bound.
 pub fn ssh_command(target: &str, remote_command: &str, opts: &SshOptions) -> ChildCommand {
-    let mut args: Vec<String> = [
-        "BatchMode=yes",
-        "ConnectTimeout=10",
-        "ServerAliveInterval=15",
-        "ServerAliveCountMax=3",
-    ]
-    .iter()
-    .flat_map(|o| ["-o".to_string(), o.to_string()])
-    .collect();
+    let mut args: Vec<String> = vec!["-T".into()];
+    args.extend(
+        [
+            "RemoteCommand=none",
+            "BatchMode=yes",
+            "ConnectTimeout=10",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=3",
+        ]
+        .iter()
+        .flat_map(|o| ["-o".to_string(), o.to_string()]),
+    );
     if opts.client == Platform::Mac {
         if let Some(dir) = &opts.control_dir {
-            args.extend(["-o".into(), "ControlMaster=auto".into()]);
-            args.extend(["-o".into(), "ControlPersist=600".into()]);
-            args.extend(["-o".into(), format!("ControlPath={}/%C", dir.display())]);
+            if control_dir_is_usable(dir) {
+                args.extend(["-o".into(), "ControlMaster=auto".into()]);
+                args.extend(["-o".into(), "ControlPersist=600".into()]);
+                // ssh splits -o values on whitespace; quote for directories with spaces.
+                args.extend(["-o".into(), format!("ControlPath=\"{}/%C\"", dir.display())]);
+            } else {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| {
+                    tracing::warn!(dir = %dir.display(), "ssh control directory unusable (quote, percent or too long); connection sharing disabled");
+                });
+            }
         }
     }
     args.push("--".into());
@@ -242,6 +273,7 @@ pub fn local_herdr_bridge_command(herdr_exe: &str, session: &str) -> ChildComman
         ],
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +414,9 @@ mod tests {
         assert_eq!(
             mac.args,
             vec![
+                "-T",
+                "-o",
+                "RemoteCommand=none",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -395,7 +430,7 @@ mod tests {
                 "-o",
                 "ControlPersist=600",
                 "-o",
-                "ControlPath=/tmp/cm/%C",
+                "ControlPath=\"/tmp/cm/%C\"",
                 "--",
                 "me@winbox",
                 "uname -s; uname -m",
@@ -462,5 +497,94 @@ mod tests {
         let c = local_herdr_bridge_command(r"C:\h\herdr.exe", "default");
         assert_eq!(c.program, r"C:\h\herdr.exe");
         assert_eq!(c.args, vec!["--session", "default", "remote-api-bridge"]);
+    }
+
+    fn has_control(c: &ChildCommand) -> bool {
+        c.args.iter().any(|a| a.starts_with("Control"))
+    }
+
+    #[test]
+    fn control_dir_with_space_is_quoted() {
+        let opts = SshOptions {
+            client: Platform::Mac,
+            control_dir: Some(PathBuf::from("/tmp/my cm")),
+        };
+        let c = ssh_command("h", "x", &opts);
+        assert!(c
+            .args
+            .contains(&"ControlPath=\"/tmp/my cm/%C\"".to_string()));
+    }
+
+    #[test]
+    fn unusable_control_dirs_disable_all_control_options() {
+        let long = PathBuf::from(format!("/tmp/{}", "a".repeat(60)));
+        let pct = PathBuf::from("/tmp/100%");
+        let quote = PathBuf::from("/tmp/a\"b");
+        for dir in [long, pct, quote] {
+            let opts = SshOptions {
+                client: Platform::Mac,
+                control_dir: Some(dir),
+            };
+            assert!(!has_control(&ssh_command("h", "x", &opts)));
+        }
+        // 104 - 58 = 46 is the first rejected length
+        let ok = SshOptions {
+            client: Platform::Mac,
+            control_dir: Some(PathBuf::from("a".repeat(45))),
+        };
+        assert!(has_control(&ssh_command("h", "x", &ok)));
+        let bad = SshOptions {
+            client: Platform::Mac,
+            control_dir: Some(PathBuf::from("a".repeat(46))),
+        };
+        assert!(!has_control(&ssh_command("h", "x", &bad)));
+    }
+
+    #[test]
+    fn posix_sh_command_double_escapes_single_quotes() {
+        let expected = [
+            r"/bin/sh -c 'printf '\''\n%s\n'\'' '\''herdr-remote-output-ready:1'\''",
+            r"exec '\''/opt/it'\''\'\'''\''s/herdr'\'' --session default remote-api-bridge'",
+        ]
+        .join("\n");
+        assert_eq!(
+            posix_sh_command(&posix_bridge_script("/opt/it's/herdr", "default")),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_discovery_script_finds_herdr_in_a_home_with_spaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("my home");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let herdr = bin.join("herdr");
+        std::fs::write(
+            &herdr,
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --check ] && echo herdr-api-bridge-v1; done\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(posix_sh_command(&posix_discovery_script("default")))
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/nonexistent")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("herdr-status-discovery:{}", herdr.display())),
+            "{stdout}"
+        );
     }
 }

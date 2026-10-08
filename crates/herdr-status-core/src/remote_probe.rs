@@ -70,10 +70,12 @@ pub enum SshFailure {
 
 pub fn classify_ssh_failure(exit_code: Option<i32>, stderr: &str) -> SshFailure {
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("permission denied") {
+    let ssh_itself = exit_code == Some(255);
+    if ssh_itself && lower.contains("permission denied") {
         SshFailure::AuthDenied
-    } else if lower.contains("host key verification failed")
-        || lower.contains("remote host identification has changed")
+    } else if ssh_itself
+        && (lower.contains("host key verification failed")
+            || lower.contains("remote host identification has changed"))
     {
         SshFailure::HostKey
     } else if exit_code == Some(255)
@@ -112,6 +114,7 @@ impl SshFailure {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +233,20 @@ mod tests {
             SshFailure::Other("boom".into()).reason("box"),
             "SSH failed: boom"
         );
+    }
+
+    #[test]
+    fn remote_stderr_noise_is_not_an_auth_hint_or_unreachable() {
+        assert_eq!(
+            classify_ssh_failure(
+                Some(1),
+                "'uname' is not recognized as an internal or external command,\r\noperable program or batch file."
+            ),
+            SshFailure::Other("operable program or batch file.".into())
+        );
+        assert!(matches!(
+            classify_ssh_failure(Some(2), ".bashrc: Permission denied"),
+            SshFailure::Other(_)
+        ));
     }
 }

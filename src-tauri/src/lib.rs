@@ -18,6 +18,7 @@ use std::time::Duration;
 use herdr_status_core::{paths, Env, Platform};
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+use tauri_plugin_window_state::StateFlags;
 
 /// `HERDR_STATUS_LOG=debug|trace` raises the log level (spec section 15).
 fn log_level() -> log::LevelFilter {
@@ -57,7 +58,12 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                // Visibility is owned by `--hidden` and the tray only.
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             commands::get_agents,
             commands::peek,
@@ -103,6 +109,10 @@ fn shutdown_hub(app: &tauri::AppHandle) {
         return;
     };
     let state = state.inner().clone();
+    // A long `apply_config` must not hold the hub lock past the exit timeout.
+    if let Some(task) = state::lock(&state.reload_task).take() {
+        task.abort();
+    }
     // The timeout also covers waiting for the hub lock (a reload may hold it).
     let result =
         tauri::async_runtime::block_on(tokio::time::timeout(Duration::from_secs(2), async move {
@@ -114,6 +124,6 @@ fn shutdown_hub(app: &tauri::AppHandle) {
             }
         }));
     if result.is_err() {
-        log::warn!("hub shutdown timed out; bridges are killed on drop");
+        log::warn!("hub could not be shut down in time; bridges may be left behind");
     }
 }

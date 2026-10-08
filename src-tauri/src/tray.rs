@@ -14,7 +14,12 @@ use crate::tray_icon::{badge_text, colour_for, render, Rgb};
 use crate::window;
 
 pub const TRAY_ID: &str = "main-tray";
-const ICON_SIZE: u32 = 44;
+/// Native tray size: 32 px shrinks exactly 2:1 to 16 px on Windows; 36 px is
+/// 18 pt at 2x on macOS.
+#[cfg(windows)]
+const ICON_SIZE: u32 = 32;
+#[cfg(not(windows))]
+const ICON_SIZE: u32 = 36;
 
 const MENU_SHOW: &str = "show";
 const MENU_RECONNECT: &str = "reconnect";
@@ -72,6 +77,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(image(colour_for(&Default::default()), None))
         .tooltip("herdr-status")
+        // The coloured icon is intended; do not let macOS recolour it.
+        .icon_as_template(false)
         .show_menu_on_left_click(false)
         .menu(&menu)
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
@@ -89,6 +96,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayMenuState {
         autostart_item: autostart,
     });
+    // Reflect an already-populated list (e.g. an agent blocked at launch).
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        let list = lock(&state.latest).clone();
+        update_tray(app, &list);
+    }
     Ok(())
 }
 
@@ -96,6 +108,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
     match id {
         MENU_SHOW => window::toggle(app),
         MENU_RECONNECT => {
+            log::info!("tray: reconnect all");
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<Arc<AppState>>();
@@ -128,12 +141,16 @@ fn handle_menu(app: &AppHandle, id: &str) {
                 log::warn!("autostart toggle failed: {e}");
             }
             let now_enabled = manager.is_enabled().unwrap_or(!enabled);
+            log::info!("tray: launch at login is now {now_enabled}");
             let _ = app
                 .state::<TrayMenuState>()
                 .autostart_item
                 .set_checked(now_enabled);
         }
-        MENU_QUIT => app.exit(0),
+        MENU_QUIT => {
+            log::info!("tray: quit requested");
+            app.exit(0)
+        }
         _ => {}
     }
 }

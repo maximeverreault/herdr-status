@@ -76,6 +76,7 @@ pub async fn boot(
         config: Mutex::new(config),
         latest: Mutex::new(Default::default()),
         config_error: Mutex::new(config_error),
+        reload_task: Mutex::new(None),
         config_watcher: Mutex::new(None),
     });
 

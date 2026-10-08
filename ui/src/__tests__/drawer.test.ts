@@ -121,4 +121,37 @@ describe("Drawer", () => {
     await vi.advanceTimersByTimeAsync(2100);
     expect(drawer.el.querySelector(".peek")!.textContent).toBe("line 1\nline 2");
   });
+
+  it("update_with_new_status_keeps_the_typed_draft", async () => {
+    drawer.open(row());
+    (drawer.el.querySelector('[data-tab="message"]') as HTMLElement).click();
+    (drawer.el.querySelector(".send input") as HTMLInputElement).value = "half typed";
+    drawer.update(row({ status: "blocked" }));
+    (drawer.el.querySelector('[data-tab="message"]') as HTMLElement).click();
+    expect((drawer.el.querySelector(".send input") as HTMLInputElement).value).toBe("half typed");
+  });
+
+  it("late_peek_from_a_previous_row_is_ignored", async () => {
+    let resolveA!: (v: { text: string; truncated: boolean }) => void;
+    (api.peek as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise((r) => (resolveA = r)));
+    drawer.open(row({ pane_id: "a" }));
+    drawer.open(row({ pane_id: "b" }));
+    await flush();
+    expect(drawer.el.querySelector(".peek")!.textContent).toBe("line 1\nline 2");
+    resolveA({ text: "STALE", truncated: false });
+    await flush();
+    expect(drawer.el.querySelector(".peek")!.textContent).toBe("line 1\nline 2");
+  });
+
+  it("disables_keys_while_a_call_is_in_flight", async () => {
+    let resolveKey!: () => void;
+    (api.sendKey as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((r) => (resolveKey = r)));
+    drawer.open(row({ status: "blocked" }));
+    await flush();
+    (drawer.el.querySelector('.key[data-key="1"]') as HTMLElement).click();
+    expect((drawer.el.querySelector(".key") as HTMLButtonElement).disabled).toBe(true);
+    resolveKey();
+    await flush();
+    expect((drawer.el.querySelector(".key") as HTMLButtonElement).disabled).toBe(false);
+  });
 });

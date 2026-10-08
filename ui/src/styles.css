@@ -41,16 +41,16 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .row.done .dot { background: var(--done); box-shadow: 0 0 10px #34c75999; }
 .row.unknown .dot { background: transparent; border: 2px solid var(--idle); width: 7px; height: 7px; }
 .row .text { flex: 1; min-width: 0; }
-.row .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.row .meta { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .name { font-weight: 600; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .meta { font-size: 11px; line-height: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row .state { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .row.blocked { background: var(--blocked-bg); }
 .row.blocked .state { color: var(--blocked-text); font-weight: 700; }
 .row.done .state { color: var(--done-text); }
 .row.open { border-radius: 8px 8px 0 0; }
 .row.dim { opacity: .4; }
-.row.flash { animation: flash 1s ease-out; }
 .row.enter { animation: enter 150ms ease-out; }
+.row.flash { animation: flash 1s ease-out; }
 @keyframes enter { from { opacity: 0; } to { opacity: 1; } }
 @keyframes flash { from { background-color: var(--flash); } to { background-color: transparent; } }
 .row.blocked.flash { animation: flash-blocked 1s ease-out; }
@@ -75,8 +75,10 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .send input { flex: 1; background: #0b0d11; border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 11.5px; padding: 6px 8px; font-family: inherit; user-select: text; }
 .send button { font-size: 11px; font-weight: 700; padding: 6px 10px; border-radius: 6px; background: #0f2a44; color: #6fb8ff; border: none; cursor: pointer; font-family: inherit; }
 .error { color: #ff6b6b; font-size: 11px; margin-top: 6px; }
+@keyframes flash-static { from, to { background-color: var(--flash); } }
+@keyframes enter-static { from, to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
-  .row.flash, .row.blocked.flash { animation: none; background-color: var(--flash); }
-  .row.enter { animation: none; }
+  .row.enter { animation: enter-static 1ms; }
+  .row.flash, .row.blocked.flash { animation: flash-static 1s steps(1, end); }
   .chip.connecting i { animation: none; }
 }

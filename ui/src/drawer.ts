@@ -23,7 +23,7 @@ export const KEYPAD: ReadonlyArray<{ key: string; label: string; cls: string }> 
 ];
 
 function messageOf(err: unknown): string {
-  if (err && typeof err === "object" && "message" in err) return String((err as ActionError).message);
+  if (err && typeof err === "object" && typeof (err as ActionError).message === "string") return (err as ActionError).message;
   return String(err);
 }
 
@@ -36,6 +36,9 @@ export class Drawer {
   private peekText = "";
   private peekTruncated = false;
   private draft = "";
+  private generation = 0;
+  private busy = false;
+  private errorText: string | null = null;
 
   constructor(
     private readonly api: Api,
@@ -62,6 +65,9 @@ export class Drawer {
 
   open(row: AgentRow): void {
     this.stopPolling();
+    this.generation++;
+    this.busy = false;
+    this.errorText = null;
     this.row = row;
     this.tab = "peek";
     this.peekText = "";
@@ -72,6 +78,8 @@ export class Drawer {
 
   close(): void {
     this.stopPolling();
+    this.generation++;
+    this.busy = false;
     this.row = null;
     this.el.replaceChildren();
     this.el.remove();
@@ -99,12 +107,15 @@ export class Drawer {
 
   private async refreshPeek(): Promise<void> {
     if (!this.row) return;
+    const generation = this.generation;
     try {
       const result = await this.api.peek(this.row.server_id, this.row.pane_id);
+      if (generation !== this.generation) return;
       this.peekText = result.text;
       this.peekTruncated = result.truncated;
       this.applyPeek();
     } catch (err) {
+      if (generation !== this.generation) return;
       this.showError(err);
     }
   }
@@ -119,35 +130,58 @@ export class Drawer {
   }
 
   private async press(key: string): Promise<void> {
-    if (!this.row) return;
+    if (!this.row || this.busy) return;
+    const generation = this.generation;
+    this.setBusy(true);
     try {
       await this.api.sendKey(this.row.server_id, this.row.pane_id, key);
     } catch (err) {
-      this.showError(err);
+      if (generation === this.generation) this.showError(err);
+    } finally {
+      if (generation === this.generation) this.setBusy(false);
     }
   }
 
+  private setBusy(busy: boolean): void {
+    this.busy = busy;
+    this.el.querySelectorAll<HTMLButtonElement>(".key, .send button").forEach((b) => {
+      b.disabled = busy;
+    });
+  }
+
   private async send(input: HTMLInputElement): Promise<void> {
-    if (!this.row) return;
+    if (!this.row || this.busy) return;
+    const generation = this.generation;
     const text = input.value;
+    this.setBusy(true);
     try {
       await this.api.sendMessage(this.row.server_id, this.row.pane_id, text);
+      if (generation !== this.generation) return;
       input.value = "";
+      const current = this.el.querySelector<HTMLInputElement>(".send input");
+      if (current) current.value = "";
       this.draft = "";
     } catch (err) {
+      if (generation !== this.generation) return;
       this.draft = text;
       this.showError(err);
+    } finally {
+      if (generation === this.generation) this.setBusy(false);
     }
   }
 
   private showError(err: unknown): void {
     const box = this.el.querySelector<HTMLElement>(".error");
     if (!box) return;
-    box.textContent = messageOf(err);
+    const text = messageOf(err);
+    this.errorText = text;
+    box.textContent = text;
     box.hidden = false;
     if (this.errorTimer !== null) clearTimeout(this.errorTimer);
     this.errorTimer = setTimeout(() => {
-      box.hidden = true;
+      this.errorText = null;
+      const current = this.el.querySelector<HTMLElement>(".error");
+      if (current) current.hidden = true;
     }, this.errorMs);
   }
 
@@ -168,6 +202,8 @@ export class Drawer {
 
   private render(): void {
     if (!this.row) return;
+    const typed = this.el.querySelector<HTMLInputElement>(".send input");
+    if (typed) this.draft = typed.value;
     this.el.replaceChildren();
     const tabs = document.createElement("div");
     tabs.className = "tabs";
@@ -222,8 +258,10 @@ export class Drawer {
 
     const error = document.createElement("div");
     error.className = "error";
-    error.hidden = true;
+    error.hidden = this.errorText === null;
+    error.textContent = this.errorText ?? "";
     this.el.appendChild(error);
     this.applyPeek();
+    if (this.busy) this.setBusy(true);
   }
 }

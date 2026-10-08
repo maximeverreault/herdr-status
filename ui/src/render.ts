@@ -11,25 +11,47 @@ const reducedMotion = (): boolean =>
   typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 export function renderHeader(root: HTMLElement, list: AgentList, nowMs: number): void {
-  root.replaceChildren();
-  const brand = document.createElement("span");
-  brand.className = "brand";
-  brand.textContent = "herdr";
-  root.appendChild(brand);
-  const chips = document.createElement("div");
-  chips.className = "chips";
+  let brand = root.querySelector<HTMLElement>(":scope > .brand");
+  if (!brand) {
+    brand = document.createElement("span");
+    brand.className = "brand";
+    brand.textContent = "herdr";
+    root.prepend(brand);
+  }
+  let chips = root.querySelector<HTMLElement>(":scope > .chips");
+  if (!chips) {
+    chips = document.createElement("div");
+    chips.className = "chips";
+    root.appendChild(chips);
+  }
+  const existing = new Map<string, HTMLElement>();
+  chips.querySelectorAll<HTMLElement>(":scope > .chip").forEach((el) => existing.set(el.dataset.server!, el));
+  const ordered: HTMLElement[] = [];
   for (const server of list.servers) {
-    const chip = document.createElement("span");
+    let chip = existing.get(server.id);
+    if (!chip) {
+      chip = document.createElement("span");
+      chip.dataset.server = server.id;
+      chip.innerHTML = `<i></i><span class="chip-label"></span>`;
+    }
     chip.className = `chip ${server.connection.state}`;
-    chip.innerHTML = `<i></i>`;
-    chip.appendChild(document.createTextNode(server.label));
+    chip.querySelector(".chip-label")!.textContent = server.label;
     chip.title =
       server.connection.state === "offline"
         ? `${server.connection.reason} · ${retryText(server.connection.retry_at, nowMs)}${server.transport ? ` · ${server.transport}` : ""}`
         : server.transport || server.connection.state;
-    chips.appendChild(chip);
+    ordered.push(chip);
   }
-  root.appendChild(chips);
+  syncChildren(chips, ordered);
+}
+
+/** Make `root`'s children exactly `ordered`, touching only nodes that are out of place. */
+function syncChildren(root: Node, ordered: Node[]): void {
+  ordered.forEach((node, i) => {
+    const at = root.childNodes[i];
+    if (at !== node) root.insertBefore(node, at ?? null);
+  });
+  while (root.childNodes.length > ordered.length) root.lastChild!.remove();
 }
 
 /** Row elements carry their latest row so click handlers never see stale data. */
@@ -45,7 +67,11 @@ function buildRow(row: AgentRow, onClick: (row: AgentRow) => void): RowElement {
   el.addEventListener("click", () => {
     if (el.row) onClick(el.row);
   });
-  el.addEventListener("animationend", () => el.classList.remove("flash", "enter"));
+  el.addEventListener("animationend", (e) => {
+    if (e.target !== el) return;
+    if (e.animationName.startsWith("flash")) el.classList.remove("flash");
+    else if (e.animationName.startsWith("enter")) el.classList.remove("enter");
+  });
   return el;
 }
 
@@ -66,23 +92,28 @@ function fillRow(el: RowElement, row: AgentRow, nowMs: number, open: boolean, di
   el.dataset.flashSeq = String(row.flash_seq);
 }
 
+function fillGroup(el: HTMLElement, group: OfflineGroup, nowMs: number): void {
+  el.querySelector(".group-label")!.textContent = group.label;
+  el.querySelector(".group-status")!.textContent = group.retry_at === null ? group.reason : `${group.reason} · ${retryText(group.retry_at, nowMs)}`;
+}
+
 function buildGroup(group: OfflineGroup, nowMs: number): HTMLElement {
   const el = document.createElement("div");
   el.className = "group";
   el.dataset.server = group.server_id;
   el.innerHTML = `<div class="group-line"><span class="group-label"></span><span class="group-status"></span></div>`;
-  el.querySelector(".group-label")!.textContent = group.label;
-  el.querySelector(".group-status")!.textContent = group.retry_at === null ? group.reason : `${group.reason} · ${retryText(group.retry_at, nowMs)}`;
+  fillGroup(el, group, nowMs);
   return el;
 }
 
 function emptyText(list: AgentList): string | null {
   if (list.rows.length > 0 || list.offline.some((g) => g.rows.length > 0)) return null;
-  const anyOnline = list.servers.some((s) => s.connection.state === "online");
-  if (anyOnline) return "No agents running";
-  const local = list.servers.find((s) => s.id === "local");
-  if (local && local.connection.state === "offline") return "herdr is not running";
-  return list.servers.length === 0 ? "No servers configured" : "Connecting…";
+  if (list.servers.some((s) => s.connection.state === "online")) return "No agents running";
+  if (list.servers.length === 0) return "Connecting…";
+  if (list.servers.some((s) => s.connection.state === "connecting")) return "Connecting…";
+  const only = list.servers.length === 1 ? list.servers[0]! : null;
+  if (only && only.id === "local") return "herdr is not running";
+  return "No servers reachable";
 }
 
 /**
@@ -93,6 +124,8 @@ function emptyText(list: AgentList): string | null {
 export function renderList(root: HTMLElement, list: AgentList, nowMs: number, opts: RenderOptions): void {
   const existing = new Map<string, RowElement>();
   root.querySelectorAll<RowElement>(".row[data-key]").forEach((el) => existing.set(el.dataset.key!, el));
+  const groups = new Map<string, HTMLElement>();
+  root.querySelectorAll<HTMLElement>(":scope > .group").forEach((el) => groups.set(el.dataset.server!, el));
   const before = new Map<string, DOMRect>();
   if (!reducedMotion()) existing.forEach((el, key) => before.set(key, el.getBoundingClientRect()));
 
@@ -111,18 +144,25 @@ export function renderList(root: HTMLElement, list: AgentList, nowMs: number, op
 
   for (const row of list.rows) place(row, false);
   for (const group of list.offline) {
-    ordered.push(buildGroup(group, nowMs));
+    let groupEl = groups.get(group.server_id);
+    if (groupEl) fillGroup(groupEl, group, nowMs);
+    else groupEl = buildGroup(group, nowMs);
+    ordered.push(groupEl);
     for (const row of group.rows) place(row, true);
   }
   const empty = emptyText(list);
   if (empty) {
-    const el = document.createElement("div");
+    const el = root.querySelector<HTMLElement>(":scope > .empty") ?? document.createElement("div");
     el.className = "empty";
     el.textContent = empty;
     ordered.push(el);
   }
-  if (opts.openKey !== null && !seen.has(opts.openKey) && opts.drawer.isConnected) opts.drawer.remove();
-  root.replaceChildren(...ordered);
+  const active = document.activeElement;
+  const peek = opts.drawer.querySelector<HTMLElement>(".peek");
+  const peekTop = peek ? peek.scrollTop : 0;
+  syncChildren(root, ordered);
+  if (peek && peek.scrollTop !== peekTop) peek.scrollTop = peekTop;
+  if (active instanceof HTMLElement && active !== document.activeElement && active.isConnected) active.focus();
 
   if (before.size > 0) {
     seen.forEach((key) => {

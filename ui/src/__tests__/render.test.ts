@@ -118,6 +118,14 @@ describe("renderList", () => {
     const down = list({ servers: [{ id: "local", label: "local", kind: "local", connection: { state: "offline", reason: "herdr is not running", retry_at: NOW }, transport: "" }] });
     renderList(main, down, NOW, { openKey: null, drawer, onRowClick: () => {} });
     expect(main.querySelector(".empty")!.textContent).toBe("herdr is not running");
+    const two = list({
+      servers: [
+        { id: "local", label: "local", kind: "local", connection: { state: "offline", reason: "herdr is not running", retry_at: NOW }, transport: "" },
+        { id: "box", label: "box", kind: "remote", connection: { state: "offline", reason: "Unreachable", retry_at: NOW }, transport: "" },
+      ],
+    });
+    renderList(main, two, NOW, { openKey: null, drawer, onRowClick: () => {} });
+    expect(main.querySelector(".empty")!.textContent).toBe("No servers reachable");
   });
 
   it("calls onRowClick with the row", () => {
@@ -135,5 +143,38 @@ describe("reconnecting group", () => {
     });
     renderList(main, l, NOW, { openKey: null, drawer, onRowClick: () => {} });
     expect(main.querySelector(".group-status")!.textContent).toBe("Reconnecting…");
+  });
+});
+
+describe("in-place diffing", () => {
+  it("rerender_with_same_list_keeps_focus_and_classes", () => {
+    const input = document.createElement("input");
+    drawer.appendChild(input);
+    const first = list({ rows: [row({ pane_id: "a", flash_seq: 0 }), row({ pane_id: "b" })] });
+    renderList(main, first, NOW, { openKey: "local|a", drawer, onRowClick: () => {} });
+    const second = list({ rows: [row({ pane_id: "a", flash_seq: 1 }), row({ pane_id: "b" })] });
+    renderList(main, second, NOW, { openKey: "local|a", drawer, onRowClick: () => {} });
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    renderList(main, second, NOW, { openKey: "local|a", drawer, onRowClick: () => {} });
+    expect(document.activeElement).toBe(input);
+    expect(main.querySelector('[data-key="local|a"]')!.classList.contains("flash")).toBe(true);
+  });
+
+  it("group_elements_are_reused_across_renders", () => {
+    const g = (reason: string) => list({ offline: [{ server_id: "box", label: "build-box", reason, retry_at: null, rows: [] }] });
+    renderList(main, g("Reconnecting…"), NOW, { openKey: null, drawer, onRowClick: () => {} });
+    const el = main.querySelector(".group")!;
+    renderList(main, g("Unreachable"), NOW, { openKey: null, drawer, onRowClick: () => {} });
+    expect(main.querySelector(".group")).toBe(el);
+    expect(el.querySelector(".group-status")!.textContent).toBe("Unreachable");
+  });
+
+  it("reuses header chips by server id", () => {
+    const l = list({});
+    renderHeader(header, l, NOW);
+    const chip = header.querySelector(".chip")!;
+    renderHeader(header, l, NOW);
+    expect(header.querySelector(".chip")).toBe(chip);
   });
 });

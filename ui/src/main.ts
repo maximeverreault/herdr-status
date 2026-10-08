@@ -1,65 +1,87 @@
 import { Drawer } from "./drawer";
 import { renderHeader, renderList } from "./render";
-import { api } from "./tauri";
+import { api, type AppApi } from "./tauri";
 import { EMPTY_LIST, rowKey, type AgentList, type AgentRow } from "./types";
 
-const header = document.querySelector<HTMLElement>("#header")!;
-const listEl = document.querySelector<HTMLElement>("#list")!;
-const banner = document.querySelector<HTMLElement>("#banner")!;
-
-let list: AgentList = EMPTY_LIST;
-const drawer = new Drawer(api);
-
-function findRow(key: string): AgentRow | null {
-  return list.rows.find((r) => rowKey(r) === key) ?? list.offline.flatMap((g) => g.rows).find((r) => rowKey(r) === key) ?? null;
+export interface Elements {
+  header: HTMLElement;
+  list: HTMLElement;
+  banner: HTMLElement;
 }
 
-function render(): void {
-  const now = Date.now();
-  renderHeader(header, list, now);
-  const openKey = drawer.currentKey;
-  if (openKey !== null) {
-    const current = findRow(openKey);
-    if (current) drawer.update(current);
-    else drawer.close();
-  }
-  renderList(listEl, list, now, {
-    openKey: drawer.currentKey,
-    drawer: drawer.el,
-    onRowClick: (row) => {
-      drawer.toggle(row);
+export async function start(appApi: AppApi, els: Elements): Promise<void> {
+  let list: AgentList = EMPTY_LIST;
+  const drawer = new Drawer(appApi);
+
+  const findRow = (key: string): AgentRow | null =>
+    list.rows.find((r) => rowKey(r) === key) ?? list.offline.flatMap((g) => g.rows).find((r) => rowKey(r) === key) ?? null;
+
+  const render = (): void => {
+    const now = Date.now();
+    renderHeader(els.header, list, now);
+    const openKey = drawer.currentKey;
+    if (openKey !== null) {
+      const current = findRow(openKey);
+      if (current) drawer.update(current);
+      else drawer.close();
+    }
+    renderList(els.list, list, now, {
+      openKey: drawer.currentKey,
+      drawer: drawer.el,
+      onRowClick: (row) => {
+        drawer.toggle(row);
+        render();
+      },
+    });
+  };
+
+  const setBanner = (message: string | null): void => {
+    els.banner.hidden = message === null;
+    els.banner.textContent = message ?? "";
+  };
+
+  setInterval(render, 15_000);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drawer.isOpen()) {
+      drawer.close();
       render();
-    },
+    }
   });
-}
 
-let receivedEvent = false;
+  render();
 
-function setBanner(message: string | null): void {
-  banner.hidden = message === null;
-  banner.textContent = message ?? "";
-}
-
-async function start(): Promise<void> {
-  await api.onAgents((next) => {
-    receivedEvent = true;
-    list = next;
-    render();
-  });
-  await api.onConfigError(setBanner);
-  const [initial, configError] = await Promise.all([api.getAgents(), api.getConfigError()]);
-  if (!receivedEvent) {
-    list = initial;
-    render();
+  let receivedAgentsEvent = false;
+  let receivedConfigEvent = false;
+  try {
+    await appApi.onAgents((next) => {
+      receivedAgentsEvent = true;
+      list = next;
+      render();
+    });
+    await appApi.onConfigError((message) => {
+      receivedConfigEvent = true;
+      setBanner(message);
+    });
+    const [agents, configError] = await Promise.allSettled([appApi.getAgents(), appApi.getConfigError()]);
+    if (configError.status === "fulfilled" && !receivedConfigEvent) setBanner(configError.value);
+    if (agents.status === "fulfilled") {
+      if (!receivedAgentsEvent) {
+        list = agents.value;
+        render();
+      }
+    } else {
+      throw agents.reason;
+    }
+  } catch (err) {
+    console.error("could not load agents", err);
+    if (!receivedConfigEvent) {
+      const message = err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string" ? (err as { message: string }).message : String(err);
+      setBanner(`Could not load agents: ${message}`);
+    }
   }
-  setBanner(configError);
 }
 
-void start();
-setInterval(render, 15_000);
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && drawer.isOpen()) {
-    drawer.close();
-    render();
-  }
-});
+const header = document.querySelector<HTMLElement>("#header");
+const listEl = document.querySelector<HTMLElement>("#list");
+const banner = document.querySelector<HTMLElement>("#banner");
+if (header && listEl && banner) void start(api, { header, list: listEl, banner });

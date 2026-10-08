@@ -78,7 +78,7 @@ pub async fn peek(
     server: String,
     pane: String,
 ) -> Result<PeekResult, ActionError> {
-    log::info!("quick action: peek server={server} pane={pane}");
+    log::debug!("quick action: peek server={server} pane={pane}");
     let deadline = Instant::now() + ACTION_TIMEOUT;
     let (client, label) = client_for(&state, &server, deadline).await?;
     let lines = state.peek_lines();

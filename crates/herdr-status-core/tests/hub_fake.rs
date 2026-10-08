@@ -116,6 +116,8 @@ async fn unchanged_servers_are_not_restarted() {
     let cfg = Config::parse("").unwrap();
     hub.apply_config(&cfg, Platform::Mac).await;
     wait_list(&mut rx, |l| l.rows.len() == 2).await;
+    // Let the one-time protocol ping land before counting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let before = local.requests().len();
     hub.apply_config(&cfg, Platform::Mac).await;
     tokio::time::sleep(Duration::from_millis(100)).await;

@@ -100,7 +100,7 @@ pub fn app_config_file(env: &Env, platform: Platform) -> PathBuf {
     }
 }
 
-/// Cache, SSH control sockets.
+/// Holds `cache.json`. SSH control sockets live under `/tmp/herdr-status-<user>`.
 pub fn app_data_dir(env: &Env, platform: Platform) -> PathBuf {
     match platform {
         Platform::Mac => home(env)

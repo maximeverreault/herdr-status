@@ -1533,7 +1533,6 @@ dependencies = [
  "tauri-plugin-window-state",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]

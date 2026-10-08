@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use herdr_client::transport::TransportError;
-use herdr_client::{Client, ClientError, Event, EventStream, SessionSnapshot, Subscription};
+use herdr_client::{
+    Client, ClientError, Event, EventStream, Method, ResponseResult, SessionSnapshot, Subscription,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -145,6 +147,7 @@ pub fn spawn_watcher(
         commands: rx,
         cancelled,
         last_offline_reason: None,
+        checked_protocol: false,
     };
     let task = tokio::spawn(watcher.run());
     WatcherHandle {
@@ -268,6 +271,8 @@ struct Watcher {
     cancelled: watch::Receiver<bool>,
     /// Last offline reason logged at info level, so repeats log at debug.
     last_offline_reason: Option<String>,
+    /// The protocol version was checked once for this watcher.
+    checked_protocol: bool,
 }
 
 /// The receiver is gone or Shutdown was requested.
@@ -423,9 +428,15 @@ impl Watcher {
             Err(end) => return Ok(Err(end)),
         };
         apply_snapshot(&mut self.state, &authoritative, SystemTime::now());
-        set_online(&mut self.state, &transport.describe());
+        let describe = transport.describe();
+        set_online(&mut self.state, &describe);
+        tracing::info!(server = %self.state.id, transport = %describe, "server online");
         self.last_offline_reason = None;
         self.publish().await?;
+        if !self.checked_protocol {
+            self.checked_protocol = true;
+            self.check_protocol(&client).await;
+        }
         Ok(Ok(Session {
             client,
             stream,
@@ -433,6 +444,24 @@ impl Watcher {
             subscribed,
             online_since: Instant::now(),
         }))
+    }
+
+    /// Warn once if herdr speaks another protocol than this bar was built for.
+    /// Never fails the session.
+    async fn check_protocol(&self, client: &Client) {
+        match tokio::time::timeout(self.cfg.request_timeout, client.request(Method::Ping)).await {
+            Ok(Ok(ResponseResult::Pong { version, protocol })) if protocol != 22 => {
+                tracing::warn!(
+                    server = %self.state.id,
+                    "herdr {version} speaks protocol {protocol}; this bar was built for 22"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(server = %self.state.id, error = %e, "protocol check failed")
+            }
+            Err(_) => tracing::debug!(server = %self.state.id, "protocol check timed out"),
+        }
     }
 
     async fn event_loop(&mut self, session: Session) -> Result<SessionEnd, Stop> {

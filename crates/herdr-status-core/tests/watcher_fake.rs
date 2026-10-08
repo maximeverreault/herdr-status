@@ -101,9 +101,10 @@ async fn goes_online_with_snapshot_rows_and_full_subscription() {
     let online = next_matching(&mut rx, |s| s.is_online()).await;
     assert_eq!(online.rows.len(), 2);
     assert!(online.transport.contains("unix socket"));
+    // The one-time protocol ping may already have been sent after S2.
     assert_eq!(
-        methods(&server),
-        vec!["session.snapshot", "events.subscribe", "session.snapshot"]
+        methods(&server)[..3],
+        ["session.snapshot", "events.subscribe", "session.snapshot"]
     );
     let subs = server.requests()[1]["params"]["subscriptions"].clone();
     let types: Vec<String> = subs
@@ -501,5 +502,29 @@ async fn backoff_resets_after_stable_session_ends_in_eof() {
         wait <= Duration::from_millis(150),
         "expected about backoff_min, got {wait:?}"
     );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn logs_protocol_mismatch_without_failing() {
+    let server = FakeHerdrServer::start().await;
+    server.set_responder(|method, _| match method {
+        "ping" => Reply::Result(serde_json::json!({"type":"pong","version":"9.9.9","protocol":23})),
+        "session.snapshot" => Reply::Result(fixture_snapshot_result()),
+        "events.subscribe" => Reply::Result(serde_json::json!({"type":"subscription_started"})),
+        other => Reply::Error {
+            code: "invalid_request".into(),
+            message: format!("unexpected {other}"),
+        },
+    });
+    let (handle, mut rx) = start(&server, test_cfg());
+    next_matching(&mut rx, |s| s.is_online()).await;
+    server.wait_for_subscribers(1).await;
+    server.reset_responder();
+    server.close_subscriptions();
+    wait_for_subscribe_count(&server, 2).await;
+    server.wait_for_subscribers(1).await;
+    let pings = methods(&server).iter().filter(|m| *m == "ping").count();
+    assert_eq!(pings, 1, "protocol is checked once per watcher");
     handle.shutdown().await;
 }

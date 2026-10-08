@@ -1,5 +1,7 @@
 //! herdr-status desktop app: Tauri glue around `herdr_status_core`.
 
+pub mod tray_icon;
+
 use tauri::Manager;
 
 pub fn run() {

@@ -37,7 +37,11 @@ pub fn apply_snapshot(state: &mut ServerState, snapshot: &SessionSnapshot, now: 
             .unwrap_or(&agent.workspace_id)
             .to_string();
         let name = display_name(agent, &workspace_label);
-        let previous = state.rows.iter().find(|r| r.pane_id == agent.pane_id);
+        // A kind change on a reused pane id counts as a new row (no since/flash).
+        let previous = state
+            .rows
+            .iter()
+            .find(|r| r.pane_id == agent.pane_id && r.agent_kind == agent.agent);
         let (since, flash_seq) = match previous {
             Some(p) if p.status == agent.agent_status => (p.since, p.flash_seq),
             Some(p) => (Some(now), p.flash_seq + 1),
@@ -59,7 +63,8 @@ pub fn apply_snapshot(state: &mut ServerState, snapshot: &SessionSnapshot, now: 
 }
 
 /// Apply a per-pane status event. Returns `false` when the pane has no row yet;
-/// the caller should then take a snapshot instead of inventing a row.
+/// the caller should then take a snapshot instead of inventing a row. Only
+/// status and agent kind come from events; names and titles come from snapshots.
 pub fn apply_status(
     state: &mut ServerState,
     event: &PaneAgentStatusChanged,
@@ -68,6 +73,9 @@ pub fn apply_status(
     let Some(row) = state.rows.iter_mut().find(|r| r.pane_id == event.pane_id) else {
         return false;
     };
+    if let Some(kind) = &event.agent {
+        row.agent_kind = Some(kind.clone());
+    }
     if row.status != event.agent_status {
         row.status = event.agent_status;
         row.since = Some(now);
@@ -90,6 +98,8 @@ pub fn set_online(state: &mut ServerState, transport: &str) {
     state.transport = transport.to_string();
 }
 
+/// Marks the server as reconnecting. Existing rows are kept; `assemble` shows
+/// them as a dimmed "Reconnecting…" group until `set_online` and a fresh snapshot.
 pub fn set_connecting(state: &mut ServerState) {
     state.connection = ConnectionState::Connecting;
 }
@@ -97,7 +107,7 @@ pub fn set_connecting(state: &mut ServerState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentStatus, ServerKind};
+    use crate::model::{assemble, AgentStatus, ServerKind};
     use herdr_client::protocol::{parse_line, ResponseResult, ServerLine};
     use herdr_client::{AgentInfo, PaneAgentStatusChanged, SessionSnapshot};
     use std::time::Duration;
@@ -277,5 +287,55 @@ mod tests {
         set_online(&mut s, "unix socket /x");
         assert!(s.is_online());
         assert_eq!(s.transport, "unix socket /x");
+    }
+
+    #[test]
+    fn kind_change_on_reused_pane_id_resets_since_and_flash() {
+        let mut s = server();
+        apply_snapshot(&mut s, &fixture(), t(1));
+        apply_status(&mut s, &status_event("w2:p1", AgentStatus::Idle), t(2));
+        let mut snap = fixture();
+        let a = snap
+            .agents
+            .iter_mut()
+            .find(|a| a.pane_id == "w2:p1")
+            .unwrap();
+        a.agent = Some("codex".into());
+        a.agent_status = AgentStatus::Blocked;
+        apply_snapshot(&mut s, &snap, t(9));
+        let w2 = s.rows.iter().find(|r| r.pane_id == "w2:p1").unwrap();
+        assert_eq!(w2.agent_kind.as_deref(), Some("codex"));
+        assert_eq!(w2.since, None);
+        assert_eq!(w2.flash_seq, 0);
+    }
+
+    #[test]
+    fn status_flip_a_b_a_bumps_flash_twice() {
+        let mut s = server();
+        apply_snapshot(&mut s, &fixture(), t(1));
+        apply_status(&mut s, &status_event("w2:p1", AgentStatus::Idle), t(2));
+        apply_status(&mut s, &status_event("w2:p1", AgentStatus::Working), t(3));
+        let w2 = s.rows.iter().find(|r| r.pane_id == "w2:p1").unwrap();
+        assert_eq!(w2.status, AgentStatus::Working);
+        assert_eq!(w2.since, Some(t(3)));
+        assert_eq!(w2.flash_seq, 2);
+    }
+
+    #[test]
+    fn offline_then_snapshot_then_online_moves_rows_back() {
+        let mut s = server();
+        apply_snapshot(&mut s, &fixture(), t(1));
+        set_online(&mut s, "x");
+        set_offline(&mut s, "Unreachable".into(), t(30));
+        let list = assemble(std::slice::from_ref(&s));
+        assert!(list.rows.is_empty());
+        assert_eq!(list.offline.len(), 1);
+        assert_eq!(list.offline[0].retry_at, Some(t(30)));
+        assert_eq!(list.offline[0].rows.len(), 2);
+        apply_snapshot(&mut s, &fixture(), t(40));
+        set_online(&mut s, "x");
+        let list = assemble(&[s]);
+        assert_eq!(list.rows.len(), 2);
+        assert!(list.offline.is_empty());
     }
 }

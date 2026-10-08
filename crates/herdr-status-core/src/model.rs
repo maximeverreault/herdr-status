@@ -43,7 +43,7 @@ pub struct AgentRow {
     pub flash_seq: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerState {
     pub id: String,
     pub label: String,
@@ -85,8 +85,9 @@ pub struct OfflineGroup {
     pub server_id: String,
     pub label: String,
     pub reason: String,
-    #[serde(serialize_with = "ser_millis")]
-    pub retry_at: SystemTime,
+    /// `None` while reconnecting (no retry scheduled).
+    #[serde(serialize_with = "ser_opt_millis")]
+    pub retry_at: Option<SystemTime>,
     pub rows: Vec<AgentRow>,
 }
 
@@ -116,6 +117,8 @@ pub fn sort_rows(rows: &mut [AgentRow]) {
             .then_with(|| cmp_since_desc(a.since, b.since))
             .then_with(|| a.server_label.cmp(&b.server_label))
             .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.server_id.cmp(&b.server_id))
+            .then_with(|| a.pane_id.cmp(&b.pane_id))
     });
 }
 
@@ -144,9 +147,18 @@ pub fn assemble(servers: &[ServerState]) -> AgentList {
                 server_id: server.id.clone(),
                 label: server.label.clone(),
                 reason: reason.clone(),
-                retry_at: *retry_at,
+                retry_at: Some(*retry_at),
                 rows: server.rows.clone(),
             }),
+            ConnectionState::Connecting if !server.rows.is_empty() => {
+                list.offline.push(OfflineGroup {
+                    server_id: server.id.clone(),
+                    label: server.label.clone(),
+                    reason: "Reconnecting…".into(),
+                    retry_at: None,
+                    rows: server.rows.clone(),
+                })
+            }
             ConnectionState::Connecting => {}
         }
     }
@@ -163,6 +175,7 @@ pub fn assemble(servers: &[ServerState]) -> AgentList {
     list
 }
 
+// Times before the epoch serialise as 0.
 fn millis(t: &SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -302,5 +315,63 @@ mod tests {
             serde_json::to_value(ConnectionState::Online).unwrap()["state"],
             "online"
         );
+    }
+
+    #[test]
+    fn sort_is_deterministic_for_equal_keys() {
+        let mk = |pane: &str| {
+            let mut r = row("local", "claude · ws", AgentStatus::Idle, None);
+            r.pane_id = pane.into();
+            r
+        };
+        let base = [mk("w1:p1"), mk("w1:p2"), mk("w2:p1"), mk("w3:p1")];
+        let mut a: Vec<AgentRow> = base.iter().rev().cloned().collect();
+        let mut b = vec![
+            base[2].clone(),
+            base[0].clone(),
+            base[3].clone(),
+            base[1].clone(),
+        ];
+        sort_rows(&mut a);
+        sort_rows(&mut b);
+        assert_eq!(a, b);
+        let ids: Vec<&str> = a.iter().map(|r| r.pane_id.as_str()).collect();
+        assert_eq!(ids, vec!["w1:p1", "w1:p2", "w2:p1", "w3:p1"]);
+    }
+
+    #[test]
+    fn connecting_server_with_stale_rows_is_shown_as_reconnecting_group() {
+        let mut s = ServerState::new("winbox", "winbox", ServerKind::Remote);
+        s.rows = vec![row("winbox", "c", AgentStatus::Done, None)];
+        let empty = ServerState::new("wsl", "wsl", ServerKind::Wsl);
+        let list = assemble(&[s, empty]);
+        assert_eq!(list.servers[0].connection, ConnectionState::Connecting);
+        assert!(list.rows.is_empty());
+        assert_eq!(list.offline.len(), 1);
+        assert_eq!(list.offline[0].reason, "Reconnecting…");
+        assert_eq!(list.offline[0].retry_at, None);
+        assert_eq!(list.offline[0].rows[0].name, "c");
+        let v = serde_json::to_value(&list.offline[0]).unwrap();
+        assert_eq!(v["retry_at"], serde_json::Value::Null);
+        assert_eq!(list.counts, Counts::default());
+    }
+
+    #[test]
+    fn assemble_interleaves_rows_from_two_online_servers_by_urgency() {
+        let mut local = ServerState::new("local", "local", ServerKind::Local);
+        local.connection = ConnectionState::Online;
+        local.rows = vec![
+            row("local", "w", AgentStatus::Working, None),
+            row("local", "i", AgentStatus::Idle, None),
+        ];
+        let mut remote = ServerState::new("box", "box", ServerKind::Remote);
+        remote.connection = ConnectionState::Online;
+        remote.rows = vec![
+            row("box", "b", AgentStatus::Blocked, None),
+            row("box", "d", AgentStatus::Done, None),
+        ];
+        let list = assemble(&[local, remote]);
+        let names: Vec<&str> = list.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "w", "d", "i"]);
     }
 }

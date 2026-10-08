@@ -8,3 +8,9 @@ ui/dist/
 
 # OS
 .DS_Store
+
+src-tauri/gen/schemas/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*Logo.png
+src-tauri/icons/StoreLogo.png

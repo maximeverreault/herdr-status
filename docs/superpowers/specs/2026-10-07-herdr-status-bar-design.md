@@ -503,3 +503,17 @@ Product name `herdr-status`, bundle identifier `com.maximeverreault.herdrstatus`
 | herdr protocol changes after 0.9.3 | Unknown fields ignored, unknown methods surface as errors, protocol number logged |
 | `ControlPath` socket path too long (104-byte limit) | Short cache directory plus `%C` hash |
 | Elapsed times reset when the bar restarts | Accepted; shown as the state word without a duration |
+
+## Implementation notes (2026-10-08)
+
+Where the build drifted from this spec:
+
+- Launch at login uses a macOS LaunchAgent, not a Login Item.
+- The SSH control directory is `/tmp/herdr-status-<user>` on macOS; Windows has none (no connection sharing).
+- The icon generator is `ui/scripts/make-app-icon.ts`.
+- The fake herdr server is Unix-only; the named-pipe transport is covered by unit tests on the Windows CI job.
+- `OfflineGroup.retry_at` is absolute milliseconds and nullable.
+- `ClientError::Closed` exists, distinct from I/O errors.
+- EOF on a subscription rebuilds it, with a streak cap before backing off.
+- The protocol number is checked once per watcher with a `ping` after the first online; a mismatch only logs a warning.
+- The macOS bundle is ad-hoc signed (`signingIdentity: "-"`); CI uploads the DMG, not the raw `.app`.

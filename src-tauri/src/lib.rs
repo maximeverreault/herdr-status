@@ -7,13 +7,9 @@ mod commands;
 mod config_watch;
 mod startup;
 mod state;
-// `pub` only to avoid dead-code warnings until Task 5 wires the tray.
-pub mod tray_icon;
-
-// `tray` and `window` arrive in Tasks 5 and 6; until then provide no-op stubs.
-mod tray {
-    pub fn update_tray(_app: &tauri::AppHandle, _list: &herdr_status_core::AgentList) {}
-}
+mod tray;
+mod tray_icon;
+mod window;
 
 use herdr_status_core::{paths, Env, Platform};
 use tauri::Manager;
@@ -48,6 +44,10 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::get_agents,
             commands::peek,
@@ -66,6 +66,7 @@ pub fn run() {
             if let Err(e) = config_watch::start(&handle) {
                 log::warn!("config watcher not started: {e}");
             }
+            tray::build(&handle)?;
             let window = app.get_webview_window("main").expect("main window exists");
             if std::env::args().any(|a| a == "--hidden") {
                 let _ = window.hide();

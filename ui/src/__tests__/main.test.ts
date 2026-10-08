@@ -89,4 +89,19 @@ describe("start", () => {
     expect(els.banner.hidden).toBe(false);
     expect(els.banner.textContent).toBe("Could not load agents: boom");
   });
+
+  it("a_rejected_getAgents_banner_clears_on_the_next_agents_event", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const api = fake({ getAgents: async () => Promise.reject({ message: "boom" }) });
+    await start(api, els);
+    expect(els.banner.hidden).toBe(false);
+    api.agentsCb(withRow("x"));
+    expect(els.banner.hidden).toBe(true);
+  });
+
+  it("a_fetched_config_error_is_not_replaced_by_a_getAgents_failure", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start(fake({ getConfigError: async () => "bad config", getAgents: async () => Promise.reject({ message: "boom" }) }), els);
+    expect(els.banner.textContent).toBe("bad config");
+  });
 });

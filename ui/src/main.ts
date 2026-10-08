@@ -35,7 +35,10 @@ export async function start(appApi: AppApi, els: Elements): Promise<void> {
     });
   };
 
-  const setBanner = (message: string | null): void => {
+  let configMsg: string | null = null;
+  let loadError: string | null = null;
+  const showBanner = (): void => {
+    const message = configMsg ?? loadError;
     els.banner.hidden = message === null;
     els.banner.textContent = message ?? "";
   };
@@ -55,15 +58,21 @@ export async function start(appApi: AppApi, els: Elements): Promise<void> {
   try {
     await appApi.onAgents((next) => {
       receivedAgentsEvent = true;
+      loadError = null;
+      showBanner();
       list = next;
       render();
     });
     await appApi.onConfigError((message) => {
       receivedConfigEvent = true;
-      setBanner(message);
+      configMsg = message;
+      showBanner();
     });
     const [agents, configError] = await Promise.allSettled([appApi.getAgents(), appApi.getConfigError()]);
-    if (configError.status === "fulfilled" && !receivedConfigEvent) setBanner(configError.value);
+    if (configError.status === "fulfilled" && !receivedConfigEvent) {
+      configMsg = configError.value;
+      showBanner();
+    }
     if (agents.status === "fulfilled") {
       if (!receivedAgentsEvent) {
         list = agents.value;
@@ -74,9 +83,10 @@ export async function start(appApi: AppApi, els: Elements): Promise<void> {
     }
   } catch (err) {
     console.error("could not load agents", err);
-    if (!receivedConfigEvent) {
+    {
       const message = err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string" ? (err as { message: string }).message : String(err);
-      setBanner(`Could not load agents: ${message}`);
+      loadError = `Could not load agents: ${message}`;
+      showBanner();
     }
   }
 }

@@ -87,6 +87,7 @@ function fillRow(el: RowElement, row: AgentRow, nowMs: number, open: boolean, di
   if (previous !== undefined && Number(previous) !== row.flash_seq) {
     el.classList.remove("flash");
     void (el as HTMLElement).offsetWidth; // restart the animation
+    el.classList.remove("enter");
     el.classList.add("flash");
   }
   el.dataset.flashSeq = String(row.flash_seq);

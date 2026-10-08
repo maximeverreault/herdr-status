@@ -183,8 +183,8 @@ pub struct RemoteSource {
     cache_path: PathBuf,
     /// Serialises first contact so concurrent callers do not resolve twice.
     resolve_lock: tokio::sync::Mutex<()>,
-    /// So a persistently unusable control dir logs once, not on every reconnect.
-    control_dir_warned: AtomicBool,
+    /// Last control-dir failure reason, so a persistent problem warns once, not on every reconnect.
+    control_dir_failure: Mutex<Option<String>>,
 }
 
 impl RemoteSource {
@@ -202,7 +202,7 @@ impl RemoteSource {
             cache,
             cache_path,
             resolve_lock: tokio::sync::Mutex::new(()),
-            control_dir_warned: AtomicBool::new(false),
+            control_dir_failure: Mutex::new(None),
         }
     }
 
@@ -211,9 +211,25 @@ impl RemoteSource {
     fn effective_ssh(&self) -> SshOptions {
         let mut ssh = self.ssh.clone();
         if let Some(dir) = ssh.control_dir.take() {
-            ssh.control_dir = crate::paths::ensure_control_dir(&dir);
-            if ssh.control_dir.is_none() && !self.control_dir_warned.swap(true, Ordering::Relaxed) {
-                tracing::warn!(target = %self.cfg.ssh_target, "ssh connection sharing disabled for this remote");
+            let mut last = self
+                .control_dir_failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match crate::paths::ensure_control_dir(&dir) {
+                Ok(valid) => {
+                    if last.take().is_some() {
+                        tracing::info!(target = %self.cfg.ssh_target, "ssh connection sharing restored");
+                    }
+                    ssh.control_dir = Some(valid);
+                }
+                Err(reason) => {
+                    if last.as_deref() != Some(reason.as_str()) {
+                        tracing::warn!(target = %self.cfg.ssh_target, %reason, "ssh connection sharing disabled for this remote");
+                        *last = Some(reason);
+                    } else {
+                        tracing::debug!(target = %self.cfg.ssh_target, %reason, "ssh connection sharing still disabled");
+                    }
+                }
             }
         }
         ssh

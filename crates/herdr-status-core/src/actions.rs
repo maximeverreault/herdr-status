@@ -116,7 +116,7 @@ pub async fn send_key(
         .map_err(|e| friendly(&e, server_label))
 }
 
-/// Send a trimmed one-line message to the agent in a pane (empty or over 16 KiB is rejected).
+/// Send a trimmed message to the agent in a pane (empty or over 16 KiB is rejected).
 pub async fn send_message(
     client: &Client,
     pane_id: &str,

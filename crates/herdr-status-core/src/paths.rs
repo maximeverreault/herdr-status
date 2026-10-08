@@ -187,8 +187,8 @@ pub fn ssh_control_dir(env: &Env, platform: Platform) -> Option<PathBuf> {
 }
 
 /// Make sure `path` is a private (mode 0700) directory owned by us and return it,
-/// or `None` if that cannot be guaranteed (callers then run without connection
-/// sharing). Called before every SSH connection because macOS periodically
+/// or the reason it cannot be guaranteed (callers then run without connection
+/// sharing and log the reason). Called before every SSH connection because macOS periodically
 /// cleans `/tmp`, and OpenSSH refuses to start with a missing ControlPath
 /// directory.
 ///
@@ -198,55 +198,59 @@ pub fn ssh_control_dir(env: &Env, platform: Platform) -> Option<PathBuf> {
 /// writable by us) and compare its uid, which is our effective uid, with the
 /// directory's uid. A directory that is ours with a looser mode is repaired to 0700.
 #[cfg(unix)]
-pub fn ensure_control_dir(path: &Path) -> Option<PathBuf> {
+pub fn ensure_control_dir(path: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let check = || -> std::io::Result<bool> {
-        if let Err(e) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-        {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e);
-            }
-        }
-        let meta = std::fs::symlink_metadata(path)?;
-        if !meta.is_dir() {
-            return Ok(false);
-        }
-        let marker = path.join(format!(".owner-check-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)?;
-        let marker_meta = std::fs::symlink_metadata(&marker);
-        let _ = std::fs::remove_file(&marker);
-        if meta.uid() != marker_meta?.uid() {
-            return Ok(false);
-        }
-        if meta.mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-            return Ok(std::fs::symlink_metadata(path)?.mode() & 0o777 == 0o700);
-        }
-        Ok(true)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique per call: concurrent calls must not delete each other's marker.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let io = |what: &str| {
+        let what = what.to_string();
+        move |e: std::io::Error| format!("{what}: {e}")
     };
-    match check() {
-        Ok(true) => Some(path.to_path_buf()),
-        Ok(false) => {
-            tracing::warn!(dir = %path.display(), "ssh control dir is not a private directory we own; connection sharing disabled");
-            None
-        }
-        Err(error) => {
-            tracing::warn!(dir = %path.display(), %error, "cannot prepare ssh control dir; connection sharing disabled");
-            None
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+    {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("cannot create {}: {e}", path.display()));
         }
     }
+    let meta = std::fs::symlink_metadata(path).map_err(io("cannot stat control dir"))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let marker = path.join(format!(
+        ".owner-check-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(io("cannot write in control dir"))?;
+    let marker_meta = std::fs::symlink_metadata(&marker);
+    let _ = std::fs::remove_file(&marker);
+    if meta.uid() != marker_meta.map_err(io("cannot stat marker"))?.uid() {
+        return Err(format!("{} is owned by another user", path.display()));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(io("cannot repair control dir mode"))?;
+        let mode = std::fs::symlink_metadata(path)
+            .map_err(io("cannot stat control dir"))?
+            .mode();
+        if mode & 0o777 != 0o700 {
+            return Err(format!("{} mode is not 0700", path.display()));
+        }
+    }
+    Ok(path.to_path_buf())
 }
 
 #[cfg(not(unix))]
-pub fn ensure_control_dir(_path: &Path) -> Option<PathBuf> {
-    None
+pub fn ensure_control_dir(_path: &Path) -> Result<PathBuf, String> {
+    Err("connection sharing is not supported on this platform".to_string())
 }
 
 #[cfg(test)]
@@ -400,21 +404,41 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let fresh = tmp.path().join("fresh");
-        assert_eq!(ensure_control_dir(&fresh), Some(fresh.clone()));
+        assert_eq!(ensure_control_dir(&fresh), Ok(fresh.clone()));
         assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o777, 0o700);
 
         let loose = tmp.path().join("loose");
         std::fs::create_dir(&loose).unwrap();
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(ensure_control_dir(&loose), Some(loose.clone()));
+        assert_eq!(ensure_control_dir(&loose), Ok(loose.clone()));
         assert_eq!(std::fs::metadata(&loose).unwrap().mode() & 0o777, 0o700);
 
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&fresh, &link).unwrap();
-        assert_eq!(ensure_control_dir(&link), None);
+        assert!(ensure_control_dir(&link).is_err());
 
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
-        assert_eq!(ensure_control_dir(&file), None);
+        assert!(ensure_control_dir(&file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_control_dir_is_safe_under_concurrent_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shared");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        assert!(ensure_control_dir(&dir).is_ok());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }

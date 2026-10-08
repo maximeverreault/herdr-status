@@ -27,6 +27,10 @@ pub enum Reply {
     CloseSilently,
     /// Write exactly this line (no id handling) and close. For malformed-response tests.
     RawLine(String),
+    /// Keep the connection open and never answer, until the client hangs up,
+    /// [`FakeHerdrServer::close_subscriptions`] is called or the server is
+    /// dropped. For request-timeout and cancellation tests.
+    Hang,
 }
 
 /// Decides the [`Reply`] for a request, given its method name and `params`.
@@ -250,6 +254,20 @@ async fn serve_connection(stream: UnixStream, inner: Arc<Inner>) {
         ),
         Reply::RawLine(line) => (Ok(line), false),
         Reply::CloseSilently => return,
+        Reply::Hang => {
+            let mut closed = inner.close.subscribe();
+            closed.borrow_and_update();
+            let mut scratch = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = closed.changed() => return,
+                    read = reader.read_until(b'\n', &mut scratch) => match read {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => scratch.clear(),
+                    },
+                }
+            }
+        }
     };
     let response = response.expect("envelope serialises");
     // Register before the ack so every push after the client reads it is delivered.

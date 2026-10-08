@@ -149,7 +149,11 @@ const MAX_REBUILD_STREAK: u32 = 5;
 /// Why a session ended.
 enum SessionEnd {
     /// Pane set changed or events were lost: resubscribe without touching the chip.
-    Rebuild,
+    /// `counted` is true for involuntary rebuilds (EOF, events lost, subscribe
+    /// rejected), which count toward the rebuild cap; pane-driven rebuilds do not.
+    Rebuild {
+        counted: bool,
+    },
     /// User asked for a reconnect.
     Reconnect,
     Failed {
@@ -174,8 +178,10 @@ impl Watcher {
             planned_rebuild = false;
             match self.run_session().await {
                 Err(Stop) => return,
-                Ok(SessionEnd::Rebuild) => {
-                    self.rebuild_streak += 1;
+                Ok(SessionEnd::Rebuild { counted }) => {
+                    if counted {
+                        self.rebuild_streak += 1;
+                    }
                     planned_rebuild = true;
                 }
                 Ok(SessionEnd::Reconnect) => {
@@ -240,7 +246,7 @@ impl Watcher {
                 not_running: false,
             }
         } else {
-            SessionEnd::Rebuild
+            SessionEnd::Rebuild { counted: true }
         }
     }
 
@@ -328,7 +334,7 @@ impl Watcher {
                 _ = sleep_until_opt(dirty_deadline) => {
                     let (_, rebuild) = dirty.take().expect("dirty is set when its sleep fires");
                     if rebuild {
-                        return Ok(SessionEnd::Rebuild);
+                        return Ok(SessionEnd::Rebuild { counted: false });
                     }
                     if let Some(end) = self.resnapshot(&client, online_since, &subscribed).await? {
                         return Ok(end);
@@ -367,7 +373,7 @@ impl Watcher {
                     .collect();
                 if current != *subscribed {
                     tracing::info!(server = %self.state.id, "pane set changed since subscribing; rebuilding");
-                    return Ok(Some(self.rebuild(Some(online_since))));
+                    return Ok(Some(SessionEnd::Rebuild { counted: false }));
                 }
                 Ok(None)
             }

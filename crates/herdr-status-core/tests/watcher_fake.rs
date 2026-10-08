@@ -311,3 +311,38 @@ async fn eof_rebuilds_without_going_offline() {
     assert_stays_online(&mut rx, Duration::from_millis(300)).await;
     handle.shutdown().await;
 }
+
+#[tokio::test]
+async fn pane_churn_does_not_trip_the_rebuild_cap() {
+    let server = FakeHerdrServer::start().await;
+    let (handle, mut rx) = start(&server, test_cfg());
+    next_matching(&mut rx, |s| s.is_online()).await;
+    server.wait_for_subscribers(1).await;
+    // Every snapshot alternates between including and omitting w2:p2.
+    let flip = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    server.set_responder(move |method, _| match method {
+        "session.snapshot" => {
+            let mut r = fixture_snapshot_result();
+            if !flip.fetch_xor(true, std::sync::atomic::Ordering::SeqCst) {
+                r["snapshot"]["panes"].as_array_mut().unwrap().push(serde_json::json!({
+                    "pane_id":"w2:p2","terminal_id":"t9","workspace_id":"w2","tab_id":"w2:t1","focused":false,"agent_status":"unknown","revision":0
+                }));
+            }
+            Reply::Result(r)
+        }
+        "events.subscribe" => Reply::Result(serde_json::json!({"type":"subscription_started"})),
+        other => Reply::Error { code: "invalid_request".into(), message: format!("unexpected {other}") },
+    });
+    for i in 0..7 {
+        server.wait_for_subscribers(1).await;
+        server.push_json(serde_json::json!({"event":"pane_created","data":{"type":"pane_created","pane":{
+            "pane_id":"w2:p2","terminal_id":"t9","workspace_id":"w2","tab_id":"w2:t1","focused":false,"agent_status":"unknown","revision":0}}}));
+        wait_for_subscribe_count(&server, i + 2).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    server.wait_for_subscribers(1).await;
+    server.close_subscriptions();
+    wait_for_subscribe_count(&server, 9).await;
+    assert_stays_online(&mut rx, Duration::from_millis(300)).await;
+    handle.shutdown().await;
+}

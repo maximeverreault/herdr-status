@@ -12,7 +12,7 @@ mod tray;
 mod tray_icon;
 mod window;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use herdr_status_core::{paths, Env, Platform};
@@ -29,7 +29,11 @@ fn log_level() -> log::LevelFilter {
     }
 }
 
+/// Set in `run()`; lets code that must not block the main thread check for it.
+pub(crate) static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
 pub fn run() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
     let env = Env::from_process();
     let platform = Platform::current();
     let log_dir = paths::app_log_dir(&env, platform);

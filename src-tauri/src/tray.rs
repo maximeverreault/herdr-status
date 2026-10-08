@@ -40,7 +40,7 @@ struct Shown {
     tooltip: Option<String>,
 }
 
-static SHOWN: Mutex<Shown> = Mutex::new(Shown {
+static TRAY_REFRESH: Mutex<Shown> = Mutex::new(Shown {
     icon: None,
     tooltip: None,
 });
@@ -155,38 +155,44 @@ fn handle_menu(app: &AppHandle, id: &str) {
 }
 
 /// Redraw the tray from the latest published list. Skips work when nothing
-/// visible changed. The cache lock is held only to read `latest` and compare;
-/// the `set_*` calls post to the main thread and wait, so they run after the
-/// guard is dropped (otherwise `build()` on the main thread could deadlock).
+/// visible changed.
+///
+/// The `TRAY_REFRESH` lock is held across the `set_*` calls, which post to the
+/// main thread and wait, so this must NEVER run on the main thread (it would
+/// deadlock against a worker holding the lock). Callers are the forward loop
+/// (a tokio worker) and `build()` via `spawn_blocking`. Holding the lock the
+/// whole time also applies updates in order, and `latest` is read under it so
+/// the last caller draws the newest list.
 pub fn refresh_tray(app: &AppHandle) {
+    let on_main = Some(std::thread::current().id()) == crate::MAIN_THREAD.get().copied();
+    debug_assert!(!on_main, "refresh_tray must not run on the main thread");
+    if on_main {
+        log::error!("refresh_tray called on the main thread; skipping to avoid a deadlock");
+        return;
+    }
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     let Some(state) = app.try_state::<Arc<AppState>>() else {
         return;
     };
-    let (new_icon, new_tooltip) = {
-        let mut shown = lock(&SHOWN);
-        // Read under the lock so the last caller draws the newest list.
-        let list = lock(&state.latest).clone();
-        let icon_key = (colour_for(&list.counts), badge_text(list.counts.blocked));
-        let text = tooltip(&list);
-        let new_icon = (shown.icon.as_ref() != Some(&icon_key)).then(|| icon_key.clone());
-        let new_tooltip = (shown.tooltip.as_deref() != Some(text.as_str())).then(|| text.clone());
-        shown.icon = Some(icon_key);
-        shown.tooltip = Some(text);
-        (new_icon, new_tooltip)
-    };
-    if let Some((colour, badge)) = new_icon {
+    let mut shown = lock(&TRAY_REFRESH);
+    let list = lock(&state.latest).clone();
+    let icon_key = (colour_for(&list.counts), badge_text(list.counts.blocked));
+    if shown.icon.as_ref() != Some(&icon_key) {
+        let (colour, badge) = &icon_key;
         if cfg!(target_os = "macos") {
-            let _ = tray.set_icon(Some(image(colour, None)));
+            let _ = tray.set_icon(Some(image(*colour, None)));
             let _ = tray.set_title(badge.as_deref());
         } else {
-            let _ = tray.set_icon(Some(image(colour, badge.as_deref())));
+            let _ = tray.set_icon(Some(image(*colour, badge.as_deref())));
         }
+        shown.icon = Some(icon_key);
     }
-    if let Some(text) = new_tooltip {
+    let text = tooltip(&list);
+    if shown.tooltip.as_deref() != Some(text.as_str()) {
         let _ = tray.set_tooltip(Some(text.as_str()));
+        shown.tooltip = Some(text);
     }
 }
 

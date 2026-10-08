@@ -20,6 +20,7 @@ pub mod watcher;
 
 pub use actions::{peek, send_key, send_message, ActionError, KEYPAD};
 pub use config::{Config, ConfigError, LocalConfig, RemoteConfig, RemoteOs, UiConfig, WslConfig};
+pub use herdr_client::{Client, ReadResult};
 pub use hub::{default_source_factory, specs_from_config, Hub, ServerSpec, SourceFactory};
 pub use model::{
     AgentList, AgentRow, AgentStatus, ConnectionState, Counts, OfflineGroup, ServerChip,
@@ -28,4 +29,5 @@ pub use model::{
 pub use paths::{Env, Platform};
 pub use prefill::{gather_inputs, prefill_config, render_prefilled, PrefillInputs};
 pub use remote_connect::{ProcessRunner, TokioRunner};
+pub use transport_source::TransportSource;
 pub use watcher::WatcherConfig;

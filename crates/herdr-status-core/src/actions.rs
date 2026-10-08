@@ -14,6 +14,14 @@ pub struct ActionError {
     pub message: String,
 }
 
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ActionError {}
+
 impl ActionError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
@@ -103,7 +111,7 @@ pub async fn send_key(
     if !KEYPAD.contains(&key) {
         return Err(ActionError::new(
             "invalid_key",
-            format!("'{key}' is not a keypad key"),
+            format!("'{key}' is not a keypad key."),
         ));
     }
     client
@@ -185,5 +193,21 @@ mod tests {
             ActionError::unknown_server("x").message,
             "Unknown server 'x'."
         );
+    }
+
+    #[test]
+    fn action_error_displays_and_is_an_error() {
+        let e = ActionError::unknown_server("x");
+        assert_eq!(e.to_string(), "unknown_server: Unknown server 'x'.");
+        let _: &dyn std::error::Error = &e;
+    }
+
+    #[tokio::test]
+    async fn invalid_key_message_ends_with_a_period() {
+        let server = herdr_client::test_support::FakeHerdrServer::start().await;
+        let client = Client::new(std::sync::Arc::new(server.transport()));
+        let err = send_key(&client, "p1", "q", "box").await.unwrap_err();
+        assert_eq!(err.code, "invalid_key");
+        assert_eq!(err.message, "'q' is not a keypad key.");
     }
 }

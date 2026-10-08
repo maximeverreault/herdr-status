@@ -5,6 +5,28 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// The commented `[[wsl]]` / `[[remote]]` examples, shared by the default file
+/// and the prefilled one.
+macro_rules! server_help {
+    () => {
+        r#"# [[wsl]]                       # Windows only; herdr running inside WSL on this machine
+# label = "wsl"
+# distro = "Ubuntu"             # default distro when omitted
+# session = "default"
+
+# [[remote]]
+# label = "winbox"
+# ssh_target = "winbox"         # any ssh target: alias, user@host, ssh://user@host:2222
+# session = "default"
+# os = "windows"                # "posix" | "windows"; auto-detected and cached when omitted
+# herdr_path = "C:\\Users\\me\\AppData\\Local\\Programs\\Herdr\\bin\\herdr.exe"
+"#
+    };
+}
+
+/// See [`server_help!`].
+pub(crate) const SERVER_HELP: &str = server_help!();
+
 pub const LOCAL_SERVER_ID: &str = "local";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +125,7 @@ impl Default for UiConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("config.toml line {}: {message}", .line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()))]
+    #[error("config.toml{}: {message}", .line.map(|l| format!(" line {l}")).unwrap_or_default())]
     Toml {
         message: String,
         line: Option<usize>,
@@ -126,29 +148,22 @@ pub enum ConfigError {
 
 impl Config {
     /// The file written on first launch: every key, commented with its default.
-    pub const DEFAULT_TOML: &'static str = r#"# herdr-status configuration. Saved changes are applied live.
+    pub const DEFAULT_TOML: &'static str = concat!(
+        r#"# herdr-status configuration. Saved changes are applied live.
 
 [local]
 enabled = true
 session = "default"             # named session -> <herdr config>/sessions/<name>/herdr.sock
 # socket_path = "/custom/herdr.sock"   # overrides session
 
-# [[wsl]]                       # Windows only; herdr running inside WSL on this machine
-# label = "wsl"
-# distro = "Ubuntu"             # default distro when omitted
-# session = "default"
-
-# [[remote]]
-# label = "winbox"
-# ssh_target = "winbox"         # any ssh target: alias, user@host, ssh://user@host:2222
-# session = "default"
-# os = "windows"                # "posix" | "windows"; auto-detected and cached when omitted
-# herdr_path = "C:\\Users\\me\\AppData\\Local\\Programs\\Herdr\\bin\\herdr.exe"
-
+"#,
+        server_help!(),
+        r#"
 [ui]
 peek_lines = 30
-reconcile_seconds = 30
-"#;
+reconcile_seconds = 30   # minimum 5
+"#
+    );
 
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(text).map_err(|e| {
@@ -201,12 +216,7 @@ reconcile_seconds = 30
         }
         for r in &self.remote {
             check_session(&r.label, &r.session)?;
-            let t = r.ssh_target.trim();
-            if t.is_empty()
-                || t != r.ssh_target
-                || t.starts_with('-')
-                || t.chars().any(char::is_whitespace)
-            {
+            if !is_valid_ssh_target(&r.ssh_target) {
                 return Err(ConfigError::InvalidSshTarget(r.label.clone()));
             }
         }
@@ -216,10 +226,10 @@ reconcile_seconds = 30
                 message: "must be between 1 and 500".into(),
             });
         }
-        if self.ui.reconcile_seconds < 1 {
+        if self.ui.reconcile_seconds < 5 {
             return Err(ConfigError::InvalidValue {
                 key: "reconcile_seconds".into(),
-                message: "must be at least 1".into(),
+                message: "must be at least 5".into(),
             });
         }
         Ok(())
@@ -243,14 +253,26 @@ reconcile_seconds = 30
     }
 }
 /// Sessions end up in socket paths and shell command lines, so keep them tame.
-fn check_session(server: &str, session: &str) -> Result<(), ConfigError> {
-    let ok = !session.is_empty()
+pub(crate) fn is_valid_session(session: &str) -> bool {
+    !session.is_empty()
         && session != "."
         && session != ".."
         && session
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Exactly as typed: no surrounding spaces, no whitespace, no leading `-`
+/// (which ssh would read as an option).
+pub(crate) fn is_valid_ssh_target(target: &str) -> bool {
+    !target.trim().is_empty()
+        && target.trim() == target
+        && !target.starts_with('-')
+        && !target.chars().any(char::is_whitespace)
+}
+
+fn check_session(server: &str, session: &str) -> Result<(), ConfigError> {
+    if is_valid_session(session) {
         Ok(())
     } else {
         Err(ConfigError::InvalidSession {
@@ -517,12 +539,36 @@ reconcile_seconds = 10
             ("[ui]\npeek_lines = 0\n", "peek_lines"),
             ("[ui]\npeek_lines = 501\n", "peek_lines"),
             ("[ui]\nreconcile_seconds = 0\n", "reconcile_seconds"),
+            ("[ui]\nreconcile_seconds = 4\n", "reconcile_seconds"),
         ] {
             match Config::parse(text).unwrap_err() {
                 ConfigError::InvalidValue { key: k, .. } => assert_eq!(k, key),
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert!(Config::parse("[ui]\npeek_lines = 500\nreconcile_seconds = 1\n").is_ok());
+        assert!(Config::parse("[ui]\npeek_lines = 500\nreconcile_seconds = 5\n").is_ok());
+    }
+
+    #[test]
+    fn toml_error_without_a_line_omits_the_line_part() {
+        let err = ConfigError::Toml {
+            message: "boom".into(),
+            line: None,
+        };
+        assert_eq!(err.to_string(), "config.toml: boom");
+        let err = ConfigError::Toml {
+            message: "boom".into(),
+            line: Some(3),
+        };
+        assert_eq!(err.to_string(), "config.toml line 3: boom");
+    }
+
+    #[test]
+    fn shared_validators_match_validate() {
+        assert!(is_valid_session("default") && is_valid_session("a.b_c-1"));
+        assert!(!is_valid_session("") && !is_valid_session("..") && !is_valid_session("a b"));
+        assert!(is_valid_ssh_target("ssh://user@host:2222") && is_valid_ssh_target("me@box"));
+        assert!(!is_valid_ssh_target("") && !is_valid_ssh_target("-oX"));
+        assert!(!is_valid_ssh_target(" a") && !is_valid_ssh_target("a b"));
     }
 }

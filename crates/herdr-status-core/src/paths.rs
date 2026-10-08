@@ -163,8 +163,8 @@ fn local_appdata(env: &Env) -> PathBuf {
 }
 
 /// Directory for ssh ControlMaster sockets. Short on purpose: a Unix socket
-/// path must fit `sun_path` (104 bytes on macOS). The hub creates it with mode
-/// 0700. Windows OpenSSH has no ControlMaster, so there is none.
+/// path must fit `sun_path` (104 bytes on macOS). `RemoteSource` validates and
+/// creates it (mode 0700) on every connection via `ensure_control_dir`. Windows OpenSSH has no ControlMaster, so there is none.
 pub fn ssh_control_dir(env: &Env, platform: Platform) -> Option<PathBuf> {
     match platform {
         Platform::Windows => None,

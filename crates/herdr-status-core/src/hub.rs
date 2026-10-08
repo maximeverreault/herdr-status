@@ -117,9 +117,7 @@ fn local_transport(
     session: &str,
 ) -> Arc<dyn Transport> {
     match platform {
-        Platform::Mac => Arc::new(herdr_client::transport::unix::UnixSocketTransport::new(
-            socket_path,
-        )),
+        Platform::Mac => unix_socket_transport(socket_path),
         Platform::Windows => {
             let pipe: Arc<dyn Transport> = windows_pipe_transport(&socket_path.to_string_lossy());
             let fallback: Arc<dyn Transport> = Arc::new(
@@ -142,9 +140,41 @@ fn windows_pipe_transport(socket_path: &str) -> Arc<dyn Transport> {
 #[cfg(not(windows))]
 fn windows_pipe_transport(socket_path: &str) -> Arc<dyn Transport> {
     // Only reachable in tests that ask for Platform::Windows on a Mac.
+    unix_socket_transport(std::path::Path::new(socket_path))
+}
+
+#[cfg(unix)]
+fn unix_socket_transport(path: &std::path::Path) -> Arc<dyn Transport> {
     Arc::new(herdr_client::transport::unix::UnixSocketTransport::new(
-        socket_path,
+        path,
     ))
+}
+
+#[cfg(not(unix))]
+fn unix_socket_transport(_path: &std::path::Path) -> Arc<dyn Transport> {
+    Arc::new(NoUnixSockets)
+}
+
+/// Stand-in on targets without Unix sockets; only reachable when a Mac
+/// configuration is built on such a target (never in production).
+#[cfg(not(unix))]
+struct NoUnixSockets;
+
+#[cfg(not(unix))]
+#[async_trait::async_trait]
+impl Transport for NoUnixSockets {
+    async fn connect(
+        &self,
+    ) -> Result<Box<dyn herdr_client::transport::Connection>, herdr_client::transport::TransportError>
+    {
+        Err(herdr_client::transport::TransportError::NotRunning(
+            "unix sockets are not available on this OS".into(),
+        ))
+    }
+
+    fn describe(&self) -> String {
+        "unix sockets are not available on this OS".into()
+    }
 }
 
 struct Running {

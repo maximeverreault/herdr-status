@@ -3,16 +3,18 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use herdr_status_core::{actions, ActionError, AgentList, Client, TransportSource};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::state::AppState;
+use crate::state::{lock, AppState};
 
-/// Upper bound for connecting plus one request.
-const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upper bound for connecting plus one request. Longer than the bridge's own
+/// 20 s ready timeout so its more specific error wins.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Serialize)]
 pub struct PeekResult {
@@ -22,33 +24,49 @@ pub struct PeekResult {
 
 #[tauri::command]
 pub fn get_agents(state: State<'_, Arc<AppState>>) -> AgentList {
-    state.latest.lock().unwrap().clone()
+    lock(&state.latest).clone()
 }
 
 /// Resolve a connected client and the server's chip label. The hub lock is
 /// held only to look up the source, never across `transport()`.
-async fn client_for(state: &AppState, server: &str) -> Result<(Client, String), ActionError> {
+async fn client_for(
+    state: &AppState,
+    server: &str,
+    deadline: Instant,
+) -> Result<(Client, String), ActionError> {
     let source: Arc<dyn TransportSource> = {
         let hub = state.hub.lock().await;
         hub.source_for(server)
     }
     .ok_or_else(|| ActionError::unknown_server(server))?;
     let label = state.label_for(server);
-    match tokio::time::timeout(ACTION_TIMEOUT, source.transport()).await {
-        Err(_) => Err(ActionError::timeout(&label)),
-        Ok(Err(_)) => Err(ActionError::unreachable(&label)),
+    match tokio::time::timeout_at(deadline, source.transport()).await {
+        Err(_) => {
+            log::warn!("quick action: connecting to {server} timed out");
+            Err(ActionError::timeout(&label))
+        }
+        Ok(Err(reason)) => {
+            log::warn!("quick action: cannot reach {server}: {reason}");
+            Err(ActionError::unreachable(&label))
+        }
         Ok(Ok(transport)) => Ok((Client::new(transport), label)),
     }
 }
 
-/// Bound one action call by [`ACTION_TIMEOUT`].
+/// Bound one action call by the shared deadline.
 async fn bounded<T>(
+    server: &str,
     label: &str,
+    deadline: Instant,
     call: impl Future<Output = Result<T, ActionError>>,
 ) -> Result<T, ActionError> {
-    tokio::time::timeout(ACTION_TIMEOUT, call)
-        .await
-        .unwrap_or_else(|_| Err(ActionError::timeout(label)))
+    match tokio::time::timeout_at(deadline, call).await {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!("quick action: request to {server} timed out");
+            Err(ActionError::timeout(label))
+        }
+    }
 }
 
 #[tauri::command]
@@ -57,10 +75,15 @@ pub async fn peek(
     server: String,
     pane: String,
 ) -> Result<PeekResult, ActionError> {
-    let (client, label) = client_for(&state, &server).await?;
+    log::info!("quick action: peek server={server} pane={pane}");
+    let deadline = Instant::now() + ACTION_TIMEOUT;
+    let (client, label) = client_for(&state, &server, deadline).await?;
+    let lines = state.peek_lines();
     let read = bounded(
+        &server,
         &label,
-        actions::peek(&client, &pane, state.peek_lines(), &label),
+        deadline,
+        actions::peek(&client, &pane, lines, &label),
     )
     .await?;
     Ok(PeekResult {
@@ -76,8 +99,16 @@ pub async fn send_key(
     pane: String,
     key: String,
 ) -> Result<(), ActionError> {
-    let (client, label) = client_for(&state, &server).await?;
-    bounded(&label, actions::send_key(&client, &pane, &key, &label)).await
+    log::info!("quick action: send_key server={server} pane={pane}");
+    let deadline = Instant::now() + ACTION_TIMEOUT;
+    let (client, label) = client_for(&state, &server, deadline).await?;
+    bounded(
+        &server,
+        &label,
+        deadline,
+        actions::send_key(&client, &pane, &key, &label),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -87,8 +118,21 @@ pub async fn send_message(
     pane: String,
     text: String,
 ) -> Result<(), ActionError> {
-    let (client, label) = client_for(&state, &server).await?;
-    bounded(&label, actions::send_message(&client, &pane, &text, &label)).await
+    log::info!("quick action: send_message server={server} pane={pane}");
+    let deadline = Instant::now() + ACTION_TIMEOUT;
+    let (client, label) = client_for(&state, &server, deadline).await?;
+    bounded(
+        &server,
+        &label,
+        deadline,
+        actions::send_message(&client, &pane, &text, &label),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn get_config_error(state: State<'_, Arc<AppState>>) -> Option<String> {
+    lock(&state.config_error).clone()
 }
 
 #[tauri::command]
@@ -113,7 +157,9 @@ pub fn open_config(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<()
 
 #[tauri::command]
 pub fn open_logs(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let _ = std::fs::create_dir_all(&state.log_dir);
+    if let Err(e) = std::fs::create_dir_all(&state.log_dir) {
+        log::warn!("could not create {}: {e}", state.log_dir.display());
+    }
     app.opener()
         .open_path(state.log_dir.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())

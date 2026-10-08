@@ -2,6 +2,7 @@
 //! forwards every `AgentList` to the webview and the tray.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use herdr_status_core::paths;
@@ -11,7 +12,7 @@ use herdr_status_core::{
 };
 use tauri::{AppHandle, Emitter};
 
-use crate::state::AppState;
+use crate::state::{lock, AppState};
 use crate::tray;
 
 /// Read `config.toml`, creating it on first launch. Returns the config and an
@@ -26,7 +27,9 @@ pub async fn load_or_create(
         let inputs = gather_inputs(runner, platform, env).await;
         let cfg = prefill_config(platform, &inputs);
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("could not create {}: {e}", parent.display());
+            }
         }
         if let Err(e) = std::fs::write(path, render_prefilled(&cfg)) {
             log::warn!("could not write initial config {}: {e}", path.display());
@@ -42,14 +45,18 @@ pub async fn load_or_create(
     }
 }
 
-pub async fn boot(app: &AppHandle) -> Result<(Arc<AppState>, Option<String>), String> {
-    let platform = Platform::current();
-    let env = Env::from_process();
+pub async fn boot(
+    app: &AppHandle,
+    env: Env,
+    platform: Platform,
+    log_dir: PathBuf,
+) -> Result<Arc<AppState>, String> {
     let config_path = paths::app_config_file(&env, platform);
     let data_dir = paths::app_data_dir(&env, platform);
-    let log_dir = paths::app_log_dir(&env, platform);
     log::info!("config file: {}", config_path.display());
-    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        log::warn!("could not create {}: {e}", data_dir.display());
+    }
     let runner: Arc<dyn ProcessRunner> = Arc::new(TokioRunner);
 
     let (config, config_error) =
@@ -70,6 +77,7 @@ pub async fn boot(app: &AppHandle) -> Result<(Arc<AppState>, Option<String>), St
         hub: tokio::sync::Mutex::new(hub),
         config: Mutex::new(config),
         latest: Mutex::new(Default::default()),
+        config_error: Mutex::new(config_error),
         config_watcher: Mutex::new(None),
     });
 
@@ -78,7 +86,7 @@ pub async fn boot(app: &AppHandle) -> Result<(Arc<AppState>, Option<String>), St
     tauri::async_runtime::spawn(async move {
         loop {
             let list = list_rx.borrow_and_update().clone();
-            *forward_state.latest.lock().unwrap() = list.clone();
+            *lock(&forward_state.latest) = list.clone();
             if let Err(e) = forward_app.emit("agents", &list) {
                 log::warn!("emit agents failed: {e}");
             }
@@ -89,7 +97,7 @@ pub async fn boot(app: &AppHandle) -> Result<(Arc<AppState>, Option<String>), St
         }
     });
 
-    Ok((state, config_error))
+    Ok(state)
 }
 
 #[cfg(test)]

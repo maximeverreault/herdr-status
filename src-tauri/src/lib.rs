@@ -6,6 +6,7 @@
 mod commands;
 mod startup;
 mod state;
+// `pub` only to avoid dead-code warnings until Task 5 wires the tray.
 pub mod tray_icon;
 
 // `tray` and `window` arrive in Tasks 5 and 6; until then provide no-op stubs.
@@ -13,7 +14,9 @@ mod tray {
     pub fn update_tray(_app: &tauri::AppHandle, _list: &herdr_status_core::AgentList) {}
 }
 
-use tauri::{Emitter, Manager};
+use herdr_status_core::{paths, Env, Platform};
+use tauri::Manager;
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
 /// `HERDR_STATUS_LOG=debug|trace` raises the log level (spec section 15).
 fn log_level() -> log::LevelFilter {
@@ -25,11 +28,22 @@ fn log_level() -> log::LevelFilter {
 }
 
 pub fn run() {
+    let env = Env::from_process();
+    let platform = Platform::current();
+    let log_dir = paths::app_log_dir(&env, platform);
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log_level())
                 .max_file_size(2_000_000)
+                .rotation_strategy(RotationStrategy::KeepSome(3))
+                .targets([
+                    Target::new(TargetKind::Folder {
+                        path: log_dir.clone(),
+                        file_name: None,
+                    }),
+                    Target::new(TargetKind::Stdout),
+                ])
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
@@ -41,14 +55,13 @@ pub fn run() {
             commands::reconnect_all,
             commands::open_config,
             commands::open_logs,
+            commands::get_config_error,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
-            let (state, config_error) = tauri::async_runtime::block_on(startup::boot(&handle))?;
+            let state =
+                tauri::async_runtime::block_on(startup::boot(&handle, env, platform, log_dir))?;
             app.manage(state);
-            if let Some(message) = config_error {
-                let _ = handle.emit("config_error", Some(message));
-            }
             let window = app.get_webview_window("main").expect("main window exists");
             if std::env::args().any(|a| a == "--hidden") {
                 let _ = window.hide();

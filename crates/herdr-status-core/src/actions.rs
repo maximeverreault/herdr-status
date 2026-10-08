@@ -202,10 +202,24 @@ mod tests {
         let _: &dyn std::error::Error = &e;
     }
 
+    struct StubTransport;
+
+    #[async_trait::async_trait]
+    impl herdr_client::Transport for StubTransport {
+        async fn connect(
+            &self,
+        ) -> Result<Box<dyn herdr_client::transport::Connection>, TransportError> {
+            Err(TransportError::NotRunning("stub".into()))
+        }
+
+        fn describe(&self) -> String {
+            "stub".into()
+        }
+    }
+
     #[tokio::test]
     async fn invalid_key_message_ends_with_a_period() {
-        let server = herdr_client::test_support::FakeHerdrServer::start().await;
-        let client = Client::new(std::sync::Arc::new(server.transport()));
+        let client = Client::new(std::sync::Arc::new(StubTransport));
         let err = send_key(&client, "p1", "q", "box").await.unwrap_err();
         assert_eq!(err.code, "invalid_key");
         assert_eq!(err.message, "'q' is not a keypad key.");

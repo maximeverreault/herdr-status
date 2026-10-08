@@ -97,10 +97,9 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         autostart_item: autostart,
     });
     // Reflect an already-populated list (e.g. an agent blocked at launch).
-    if let Some(state) = app.try_state::<Arc<AppState>>() {
-        let list = lock(&state.latest).clone();
-        update_tray(app, &list);
-    }
+    // Off the main thread: the tray setters wait for it.
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || refresh_tray(&handle));
     Ok(())
 }
 
@@ -155,29 +154,39 @@ fn handle_menu(app: &AppHandle, id: &str) {
     }
 }
 
-/// Called with every published list. Skips work when nothing visible changed.
-pub fn update_tray(app: &AppHandle, list: &AgentList) {
+/// Redraw the tray from the latest published list. Skips work when nothing
+/// visible changed. The cache lock is held only to read `latest` and compare;
+/// the `set_*` calls post to the main thread and wait, so they run after the
+/// guard is dropped (otherwise `build()` on the main thread could deadlock).
+pub fn refresh_tray(app: &AppHandle) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let colour = colour_for(&list.counts);
-    let badge = badge_text(list.counts.blocked);
-    let text = tooltip(list);
-    let mut shown = lock(&SHOWN);
-    let icon_key = (colour, badge);
-    if shown.icon.as_ref() != Some(&icon_key) {
-        let (colour, badge) = &icon_key;
+    let Some(state) = app.try_state::<Arc<AppState>>() else {
+        return;
+    };
+    let (new_icon, new_tooltip) = {
+        let mut shown = lock(&SHOWN);
+        // Read under the lock so the last caller draws the newest list.
+        let list = lock(&state.latest).clone();
+        let icon_key = (colour_for(&list.counts), badge_text(list.counts.blocked));
+        let text = tooltip(&list);
+        let new_icon = (shown.icon.as_ref() != Some(&icon_key)).then(|| icon_key.clone());
+        let new_tooltip = (shown.tooltip.as_deref() != Some(text.as_str())).then(|| text.clone());
+        shown.icon = Some(icon_key);
+        shown.tooltip = Some(text);
+        (new_icon, new_tooltip)
+    };
+    if let Some((colour, badge)) = new_icon {
         if cfg!(target_os = "macos") {
-            let _ = tray.set_icon(Some(image(*colour, None)));
+            let _ = tray.set_icon(Some(image(colour, None)));
             let _ = tray.set_title(badge.as_deref());
         } else {
-            let _ = tray.set_icon(Some(image(*colour, badge.as_deref())));
+            let _ = tray.set_icon(Some(image(colour, badge.as_deref())));
         }
-        shown.icon = Some(icon_key);
     }
-    if shown.tooltip.as_deref() != Some(text.as_str()) {
+    if let Some(text) = new_tooltip {
         let _ = tray.set_tooltip(Some(text.as_str()));
-        shown.tooltip = Some(text);
     }
 }
 

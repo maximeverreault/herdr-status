@@ -89,7 +89,7 @@ pub async fn boot(
             if let Err(e) = forward_app.emit("agents", &list) {
                 log::warn!("emit agents failed: {e}");
             }
-            tray::update_tray(&forward_app, &list);
+            tray::refresh_tray(&forward_app);
             if list_rx.changed().await.is_err() {
                 break;
             }

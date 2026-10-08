@@ -20,9 +20,9 @@ pub struct AppState {
     pub latest: Mutex<AgentList>,
     /// Banner text when `config.toml` is invalid; read by the UI at start.
     pub config_error: Mutex<Option<String>>,
-    /// Keeps the config file watcher alive for the life of the app.
     /// The serialised reload task; aborted on exit.
     pub reload_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Keeps the config file watcher alive for the life of the app.
     pub config_watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
